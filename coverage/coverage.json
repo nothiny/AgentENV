@@ -1,0 +1,25 @@
+{
+  "branches": {
+    "coverage": "-",
+    "missed": 0,
+    "total": 0
+  },
+  "functions": {
+    "coverage": "78.05%",
+    "missed": 1551,
+    "total": 7067
+  },
+  "generated_at": "2026-11-14T15:32:31Z",
+  "lines": {
+    "coverage": "80.63%",
+    "missed": 11488,
+    "total": 59309
+  },
+  "package": "workspace",
+  "regions": {
+    "coverage": "77.23%",
+    "missed": 14107,
+    "total": 61941
+  },
+  "run_url": "https://github.com/nothiny/AgentENV/actions/runs/43608550921"
+}
