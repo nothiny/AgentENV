@@ -8,7 +8,7 @@
 #    is rejected with 400 backend_not_enabled.
 # 2. Node with both backends: container requests for capabilities it lacks
 #    are rejected with 400 unsupported_capability before any work, and a
-#    plain container request reaches the (not yet implemented) factory.
+#    plain container request creates a container sandbox (C2).
 set -uo pipefail
 
 BASE=/src/scripts/tests/container-backend-c0/c0.toml
@@ -106,13 +106,12 @@ for case in '"autoPause":true' '"autoResume":{"enabled":true}' '"extraBootArgs":
 done
 
 call POST /sandboxes-cold "{\"image\":\"$IMAGE\",\"backend\":\"container\"}"
-if [ "$STATUS" = 500 ] && grep -q "cannot launch sandboxes yet" <<<"$BODY_OUT"; then
-    pass "plain container request reaches the container factory"
-else
-    fail "plain container request: HTTP $STATUS $BODY_OUT"
-fi
+expect 201 "" "plain container request creates a container sandbox"
+CID=$(jq -r .sandboxID <<<"$BODY_OUT")
+call DELETE "/sandboxes/$CID"
+expect 204 "" "container sandbox deletes"
 call GET /sandboxes
-[ "$(jq 'length' <<<"$BODY_OUT")" = 0 ] && pass "failed container create leaves no sandbox" \
+[ "$(jq 'length' <<<"$BODY_OUT")" = 0 ] && pass "no sandbox left behind" \
     || fail "sandboxes left behind: $BODY_OUT"
 stop_server
 

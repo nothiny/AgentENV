@@ -137,10 +137,13 @@ async fn main() -> anyhow::Result<()> {
         );
     }
     if config.backend_enabled(SandboxBackendKind::Container) {
-        factory = factory.with(
-            SandboxBackendKind::Container,
-            ContainerSandboxFactory::from_config(&config.container),
-        );
+        let container = ContainerSandboxFactory::from_config(config);
+        // Container sandboxes do not survive a restart; clear what the last
+        // run left before accepting requests.
+        if let Err(err) = container.reconcile().await {
+            warn!(target: "agentenv", error = %format_args!("{err:#}"), "container reconciliation incomplete");
+        }
+        factory = factory.with(SandboxBackendKind::Container, container);
     }
     info!(target: "agentenv", backends = ?config.enabled_backends, "sandbox backends enabled");
     let orchestrator = Orchestrator::with_file_backed_store_factory_and_volumes(

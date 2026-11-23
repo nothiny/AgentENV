@@ -465,6 +465,18 @@ impl Slot {
         self.netns_dir.join(&self.namespace_id)
     }
 
+    /// The guest link inside the slot: the `tap0` address, the guest address
+    /// behind it, and their prefix length. Firecracker hands these to the
+    /// kernel through `ip=`; the container backend assigns them to a veth pair
+    /// whose slot-side end it also names `tap0`.
+    pub(crate) fn guest_link(&self) -> (Ipv4Addr, Ipv4Addr, u8) {
+        (
+            self.address_plan.tap_ip(),
+            self.address_plan.vm_ip(),
+            self.address_plan.vm_link_prefix(),
+        )
+    }
+
     pub(crate) fn set_egress_policy(
         &mut self,
         policy: Option<&SandboxNetworkPolicy>,
