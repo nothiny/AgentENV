@@ -10,6 +10,7 @@ use std::fs;
 use tracing::{info, warn};
 
 use crate::cfg::AppConfig;
+use crate::types::SandboxBackendKind;
 
 /// Provision runtime dependencies into the configured deps path.
 pub async fn ensure_dependencies(config: &AppConfig) -> Result<()> {
@@ -116,9 +117,16 @@ pub async fn ensure_environment(
     // 1. Validate runtime OS packages without attempting elevation.
     packages::check_runtime()?;
 
-    // 2. Selected virtualization mode and /dev/kvm check.
-    info!(virtualization_mode = %config.virtualization_mode, "checking virtualization availability");
-    kvm::check(config.virtualization_mode)?;
+    // 2. Per-backend prerequisites: /dev/kvm for Firecracker; root and an
+    //    OCI runtime for containers.
+    if config.backend_enabled(SandboxBackendKind::Firecracker) {
+        info!(virtualization_mode = %config.virtualization_mode, "checking virtualization availability");
+        kvm::check(config.virtualization_mode)?;
+    }
+    if config.backend_enabled(SandboxBackendKind::Container) {
+        info!(runtime = %config.container.runtime, "checking container runtime");
+        check_container_runtime(config)?;
+    }
 
     // 3. ublk setup
     info!("checking ublk module and permissions");
@@ -149,9 +157,45 @@ pub async fn ensure_environment(
     Ok(())
 }
 
+/// The container backend runs rootful OCI containers, which need root and the
+/// full capability set, and drives them with the runtime CLI, `nsenter` and
+/// `ip`.
+fn check_container_runtime(config: &AppConfig) -> Result<()> {
+    if !nix::unistd::Uid::effective().is_root() {
+        anyhow::bail!(
+            "the container backend requires the server to run as root, as the Docker deployment does; \
+             remove \"container\" from enabled_backends to run without root"
+        );
+    }
+    missing_container_tools(&config.container.runtime, |tool| which::which(tool).is_ok())
+}
+
+fn missing_container_tools(runtime: &str, present: impl Fn(&str) -> bool) -> Result<()> {
+    let missing: Vec<&str> = [runtime, "nsenter", "ip"]
+        .into_iter()
+        .filter(|tool| !present(tool))
+        .collect();
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "the container backend needs these executables, which were not found: {}",
+            missing.join(", ")
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::is_valid_runtime_account_name;
+    use super::missing_container_tools;
+
+    #[test]
+    fn container_tools_are_reported_when_missing() {
+        assert!(missing_container_tools("runc", |_| true).is_ok());
+        let err = missing_container_tools("/opt/crun", |tool| tool == "ip").unwrap_err();
+        assert!(err.to_string().ends_with("not found: /opt/crun, nsenter"), "{err}");
+    }
 
     #[test]
     fn runtime_account_names_match_installer_validation() {

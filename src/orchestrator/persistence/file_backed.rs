@@ -293,6 +293,17 @@ impl SandboxPersister for FileBackedSandboxPersister {
                 continue;
             }
 
+            if !factory.restores_paused(record.metadata.backend) {
+                warn!(
+                    sandbox_id = %sandbox_id,
+                    backend = %record.metadata.backend,
+                    "loading paused sandbox metadata without resumable runtime state because its backend is not enabled on this node"
+                );
+                retained_artifacts.insert(sandbox_id);
+                sandboxes.push(record.into_metadata_without_runtime_state());
+                continue;
+            }
+
             match record.into_metadata(factory) {
                 Ok(metadata) => {
                     retained_artifacts.insert(sandbox_id);
@@ -767,6 +778,42 @@ mod tests {
 
         assert_eq!(loaded.len(), 1);
         assert!(persister.sandbox_artifact_root(&sandbox_id).exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn load_all_keeps_paused_records_of_backends_this_node_does_not_run(
+    ) -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let persister = test_persister(temp.path());
+        let sandbox_id = SandboxId::new();
+        let snapshot_root = persister
+            .sandbox_artifact_root(&sandbox_id)
+            .join("paused-generation");
+        let paused_state = paused_state(&snapshot_root);
+        let metadata = SandboxMetadata {
+            id: sandbox_id,
+            paused_state: Some(Arc::clone(&paused_state)),
+            ..Default::default()
+        };
+        persister
+            .persist_paused(&metadata, Some(&snapshot_root), paused_state.as_ref())
+            .await?;
+
+        // A container-only node cannot rebuild Firecracker paused state.
+        let container_only = crate::sandbox::BackendRegistry::new().with(
+            crate::types::SandboxBackendKind::Container,
+            MockBackendFactory::new(),
+        );
+        let loaded = persister.load_all(&container_only).await?;
+
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].state, SandboxState::Paused);
+        assert!(loaded[0].paused_state.is_none());
+        assert!(persister.sandbox_artifact_root(&sandbox_id).exists());
+        // A node that runs Firecracker again still resumes it.
+        let reloaded = persister.load_all(&MockBackendFactory::new()).await?;
+        assert!(reloaded[0].paused_state.is_some());
         Ok(())
     }
 

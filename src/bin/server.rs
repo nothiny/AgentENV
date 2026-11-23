@@ -104,8 +104,11 @@ async fn main() -> anyhow::Result<()> {
     )
     .await?;
 
-    if let Err(err) = FirecrackerPool::prime(std::time::Duration::from_secs(10)).await {
-        warn!(target: "agentenv", error = %err, "firecracker pool prime failed; continuing startup");
+    let firecracker_enabled = config.backend_enabled(SandboxBackendKind::Firecracker);
+    if firecracker_enabled {
+        if let Err(err) = FirecrackerPool::prime(std::time::Duration::from_secs(10)).await {
+            warn!(target: "agentenv", error = %err, "firecracker pool prime failed; continuing startup");
+        }
     }
 
     let snapshot_p2p_transport = config
@@ -157,7 +160,10 @@ async fn main() -> anyhow::Result<()> {
             ObservabilityService::new(
                 identity,
                 Arc::clone(&orchestrator),
-                config.resolved_cpu_template_helper(),
+                // The CPU template describes Firecracker guests only.
+                config
+                    .resolved_cpu_template_helper()
+                    .filter(|_| firecracker_enabled),
                 cluster_cpu_arc,
                 p2p_local_endpoint.clone(),
             )
@@ -229,7 +235,8 @@ async fn main() -> anyhow::Result<()> {
             if let Err(err) = shutdown_orchestrator.shutdown().await {
                 warn!(target: "agentenv", error = %err, "error occurred while shutting down orchestrator");
             }
-            if let Some(pool) = FirecrackerPool::global() {
+            // `global` would create the pool, so skip it when Firecracker is off.
+            if let Some(pool) = firecracker_enabled.then(FirecrackerPool::global).flatten() {
                 info!(target: "agentenv", "shutting down firecracker pool");
                 if let Err(err) = pool.shutdown().await {
                     warn!(target: "agentenv", error = %err, "error occurred while shutting down firecracker pool");

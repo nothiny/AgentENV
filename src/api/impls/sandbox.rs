@@ -1640,6 +1640,11 @@ impl Sandboxes<()> for ApiImpl {
                     Self::error(409, err.to_string()),
                 ));
             }
+            Err(err) if err.is_backend_rejection() => {
+                return Ok(SandboxesSandboxIdConnectPostResponse::Status400_BadRequest(
+                    err.into(),
+                ));
+            }
             Err(err) => {
                 // The custom extension rejected the start-resume hook with a 4xx.
                 if let Some(message) = hook_client_error_message(&err) {
@@ -2277,6 +2282,11 @@ impl Sandboxes<()> for ApiImpl {
             Err(err @ OrchestratorError::SandboxOperationConflict { .. }) => {
                 return Ok(SandboxesSandboxIdResumePostResponse::Status409_Conflict(
                     Self::error(409, err.to_string()),
+                ));
+            }
+            Err(err) if err.is_backend_rejection() => {
+                return Ok(SandboxesSandboxIdResumePostResponse::Status400_BadRequest(
+                    err.into(),
                 ));
             }
             Err(err) => {

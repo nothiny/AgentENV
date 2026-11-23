@@ -93,8 +93,11 @@ pub async fn ensure(config: &AppConfig, deps_path: &Path) -> Result<()> {
 
     std::fs::create_dir_all(deps_path)?;
 
-    ensure_firecracker(config, manifest, &arch).await?;
-    ensure_kernel(config, manifest, &arch).await?;
+    // The VMM and guest kernel are only needed by the Firecracker backend.
+    if config.backend_enabled(crate::types::SandboxBackendKind::Firecracker) {
+        ensure_firecracker(config, manifest, &arch).await?;
+        ensure_kernel(config, manifest, &arch).await?;
+    }
 
     // regctl is a runtime dependency for all registry access, not just tools
     // drive extraction, so it remains provisioned for explicit tools drives.

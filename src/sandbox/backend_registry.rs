@@ -101,6 +101,10 @@ impl SandboxBackendFactory for BackendRegistry {
             .decode_paused_state(artifact_root, state)
     }
 
+    fn restores_paused(&self, backend: SandboxBackendKind) -> bool {
+        backend.supports(crate::types::BackendCapability::Pause) && self.is_registered(backend)
+    }
+
     fn build_from_paused_state(
         &self,
         sandbox_id: SandboxId,
@@ -155,6 +159,16 @@ mod tests {
             .with(SandboxBackendKind::Container, named("ct"));
         assert_eq!(handled_by(&registry, SandboxBackendKind::Container), "ct");
         assert_eq!(handled_by(&registry, SandboxBackendKind::Firecracker), "fc");
+    }
+
+    #[test]
+    fn restores_paused_sandboxes_only_of_registered_pausing_backends() {
+        let firecracker_only = BackendRegistry::firecracker(named("fc"));
+        assert!(firecracker_only.restores_paused(SandboxBackendKind::Firecracker));
+        assert!(!firecracker_only.restores_paused(SandboxBackendKind::Container));
+        let container_only = BackendRegistry::new().with(SandboxBackendKind::Container, named("ct"));
+        assert!(!container_only.restores_paused(SandboxBackendKind::Firecracker));
+        assert!(!container_only.restores_paused(SandboxBackendKind::Container));
     }
 
     #[test]

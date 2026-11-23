@@ -16,12 +16,14 @@ use async_trait::async_trait;
 
 use super::proxy::{build_proxy_client, ProxyClient};
 use crate::api_key::ApiKey;
+use crate::cfg::ConfigManager;
 use crate::image::ImageResolver;
 use crate::observability::ObservabilityService;
 use crate::orchestrator::Orchestrator;
 use crate::repository::RepositoryError;
 use crate::snapshot::SnapshotManager;
 use crate::template::TemplateBuilder;
+use crate::types::SandboxBackendKind;
 use crate::volume::VolumeManager;
 use agentenv_http_server::{apis, models};
 
@@ -117,6 +119,19 @@ impl ApiImpl {
 
     fn error(code: i32, message: impl Into<String>) -> models::Error {
         models::Error::new(code, message.into())
+    }
+
+    /// Template and image builds run in Firecracker builder sandboxes.
+    fn require_firecracker_for_builds() -> Result<(), models::Error> {
+        if ConfigManager::global_config().backend_enabled(SandboxBackendKind::Firecracker) {
+            return Ok(());
+        }
+        let mut error = Self::error(
+            400,
+            "template and image builds run in Firecracker sandboxes, and this node does not enable the firecracker backend",
+        );
+        error.reason = Some("backend_not_enabled".to_owned());
+        Err(error)
     }
 
     fn internal_error(err: &dyn std::error::Error) -> models::Error {

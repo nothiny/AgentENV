@@ -329,6 +329,7 @@ impl ApiImpl {
         &self,
         body: &models::TemplateBuildRequestV3,
     ) -> Result<models::TemplateRequestResponseV3, models::Error> {
+        Self::require_firecracker_for_builds()?;
         let name = body
             .name
             .as_deref()

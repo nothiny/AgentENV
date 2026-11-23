@@ -340,6 +340,14 @@ pub trait SandboxBackendFactory: Send + Sync + 'static {
         state: Value,
     ) -> Result<Arc<dyn PausedSandboxState>>;
 
+    /// Whether paused sandboxes of `backend` can be rebuilt by this factory.
+    /// Paused records it cannot rebuild are kept, with their artifacts, for a
+    /// node that can, instead of being discarded as unusable.
+    fn restores_paused(&self, backend: crate::types::SandboxBackendKind) -> bool {
+        let _ = backend;
+        true
+    }
+
     /// Build a sandbox backend from backend-specific paused state captured by `pause`.
     fn build_from_paused_state(
         &self,

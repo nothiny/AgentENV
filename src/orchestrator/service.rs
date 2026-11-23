@@ -1749,6 +1749,11 @@ where
                 node_mode,
             });
         }
+        if !ConfigManager::global_config().backend_enabled(metadata.backend) {
+            return Err(OrchestratorError::BackendNotEnabled {
+                backend: metadata.backend,
+            });
+        }
 
         match self
             .store

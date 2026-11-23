@@ -944,6 +944,9 @@ impl Templates<()> for ApiImpl {
         path_params: &models::V2TemplatesTemplateIdBuildsBuildIdPostPathParams,
         body: &models::TemplateBuildStartV2,
     ) -> Result<V2TemplatesTemplateIdBuildsBuildIdPostResponse, ()> {
+        if let Err(error) = Self::require_firecracker_for_builds() {
+            return Ok(v2_start_build_error(error));
+        }
         if path_params.template_id != path_params.build_id {
             return Ok(v2_start_build_error(Self::error(
                 400,
