@@ -1,5 +1,7 @@
 mod access;
 mod backend;
+#[cfg(test)]
+mod container_c0;
 pub(crate) mod custom_extension;
 mod envd;
 mod extra_drive;
