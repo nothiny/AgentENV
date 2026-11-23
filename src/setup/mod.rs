@@ -194,7 +194,10 @@ mod tests {
     fn container_tools_are_reported_when_missing() {
         assert!(missing_container_tools("runc", |_| true).is_ok());
         let err = missing_container_tools("/opt/crun", |tool| tool == "ip").unwrap_err();
-        assert!(err.to_string().ends_with("not found: /opt/crun, nsenter"), "{err}");
+        assert!(
+            err.to_string().ends_with("not found: /opt/crun, nsenter"),
+            "{err}"
+        );
     }
 
     #[test]

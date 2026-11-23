@@ -166,7 +166,8 @@ mod tests {
         let firecracker_only = BackendRegistry::firecracker(named("fc"));
         assert!(firecracker_only.restores_paused(SandboxBackendKind::Firecracker));
         assert!(!firecracker_only.restores_paused(SandboxBackendKind::Container));
-        let container_only = BackendRegistry::new().with(SandboxBackendKind::Container, named("ct"));
+        let container_only =
+            BackendRegistry::new().with(SandboxBackendKind::Container, named("ct"));
         assert!(!container_only.restores_paused(SandboxBackendKind::Firecracker));
         assert!(!container_only.restores_paused(SandboxBackendKind::Container));
     }

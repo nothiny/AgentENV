@@ -15,6 +15,7 @@
 //! `SandboxBackendKind::supports`).
 
 mod bundle;
+mod guest;
 mod netns;
 mod runtime;
 
@@ -260,6 +261,7 @@ pub struct ContainerSandbox {
     guest_netns: Option<PathBuf>,
     exited: Option<watch::Receiver<ExitState>>,
     envd: Option<EnvdInstance>,
+    last_cpu: guest::CpuSample,
 }
 
 impl ContainerSandbox {
@@ -289,11 +291,21 @@ impl ContainerSandbox {
             guest_netns: None,
             exited: None,
             envd: None,
+            last_cpu: Default::default(),
         }
     }
 
     fn log_path(&self) -> PathBuf {
         self.work_dir.join("container.log")
+    }
+
+    /// `cgroupsPath` in the bundle, relative to this server's cgroup root.
+    fn cgroups_path(&self) -> String {
+        format!("{CGROUP_PARENT}/{}", self.container_id)
+    }
+
+    fn cgroup_dir(&self) -> PathBuf {
+        PathBuf::from(format!("/sys/fs/cgroup{}", self.cgroups_path()))
     }
 
     async fn attach_storage(&mut self, config: &AppConfig) -> Result<()> {
@@ -400,7 +412,7 @@ impl ContainerSandbox {
             .as_ref()
             .map(|slot| slot.guest_dns_server())
             .context("network slot missing")?;
-        let cgroups_path = format!("{CGROUP_PARENT}/{}", self.container_id);
+        let cgroups_path = self.cgroups_path();
         bundle::write_bundle(&BundleSpec {
             work_dir: &self.work_dir,
             hostname: HOSTNAME,
@@ -548,9 +560,17 @@ impl ContainerSandbox {
 
 #[async_trait]
 impl SandboxBackend for ContainerSandbox {
+    /// Metrics and logs come from the host side (cgroup, rootfs, runtime
+    /// log); see [`guest`].
     fn envd(&self) -> Option<Arc<dyn EnvdApi>> {
-        let envd = self.envd.clone()?;
-        Some(Arc::new(envd))
+        self.envd.as_ref()?;
+        Some(Arc::new(guest::ContainerGuest {
+            cgroup: self.cgroup_dir(),
+            rootfs: self.work_dir.join("rootfs"),
+            log: self.log_path(),
+            cpu_count: self.resources.cpu_count,
+            last_cpu: Arc::clone(&self.last_cpu),
+        }))
     }
 
     async fn start(&mut self) -> Result<()> {

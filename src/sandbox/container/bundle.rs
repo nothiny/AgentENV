@@ -6,7 +6,8 @@
 //! ```text
 //! rootfs/            the OverlayBD rootfs device, mounted read-write
 //! tools/             the tools drive, mounted read-only; tools/agentenv -> /agentenv
-//! init.sh            container init, bound at /.aenv-init
+//! init.sh            one-time guest setup, bound at /.aenv-init
+//! inittab            busybox init's table, bound at /etc/inittab
 //! etc/{resolv.conf,hosts,hostname}
 //! netns              the container's network namespace
 //! config.json
@@ -21,9 +22,9 @@ use serde_json::{json, Value};
 
 use crate::types::SandboxResources;
 
-/// Container counterpart of the tools drive's `pivot-init`: no pivot_root
-/// and no kernel `ip=` arguments (the bundle provides rootfs, mounts, network
-/// and /etc files), and envd runs as PID 1 instead of under runsv.
+/// Container counterpart of the tools drive's `pivot-init`, run once by
+/// busybox init before envd: no pivot_root and no kernel `ip=` arguments, as
+/// the bundle provides rootfs, mounts, network and /etc files.
 pub(super) const INIT_SCRIPT: &str = r#"#!/agentenv/bin/busybox sh
 BB=/agentenv/bin/busybox
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
@@ -39,8 +40,16 @@ if [ ! -e /etc/passwd ]; then
     $BB mkdir -p /etc /root
     $BB printf 'root:x:0:0:root:/root:%s\n' "$shell" > /etc/passwd
 fi
-exec /agentenv/envd -isnotfc -port "$AENV_ENVD_PORT"
 "#;
+
+/// busybox init is PID 1: it reaps orphaned processes, which envd does not,
+/// and restarts envd if it dies, as runsv does in the VM.
+fn inittab(envd_port: u16) -> String {
+    format!(
+        "::sysinit:/agentenv/bin/busybox sh /.aenv-init\n\
+         ::respawn:/agentenv/envd -isnotfc -port {envd_port}\n"
+    )
+}
 
 /// Docker's default capability set, without `CAP_NET_RAW`.
 const CAPABILITIES: &[&str] = &[
@@ -77,6 +86,7 @@ pub(super) fn write_bundle(spec: &BundleSpec<'_>) -> Result<()> {
     let dir = spec.work_dir;
     fs::create_dir_all(dir.join("etc")).context("create bundle etc directory")?;
     fs::write(dir.join("init.sh"), INIT_SCRIPT).context("write container init")?;
+    fs::write(dir.join("inittab"), inittab(spec.envd_port)).context("write inittab")?;
     let resolv: String = spec
         .nameservers
         .iter()
@@ -114,11 +124,10 @@ pub(super) fn oci_config(spec: &BundleSpec<'_>) -> Value {
         "process": {
             "terminal": false,
             "user": {"uid": 0, "gid": 0},
-            "args": ["/agentenv/bin/busybox", "sh", "/.aenv-init"],
+            "args": ["/agentenv/bin/busybox", "init"],
             "env": [
                 "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
                 "HOME=/root",
-                format!("AENV_ENVD_PORT={}", spec.envd_port),
             ],
             "cwd": "/",
             "capabilities": {
@@ -149,6 +158,7 @@ pub(super) fn oci_config(spec: &BundleSpec<'_>) -> Value {
              "options": ["nosuid", "nodev", "mode=755"]},
             bind("/agentenv", &dir.join("tools/agentenv"), true),
             bind("/.aenv-init", &dir.join("init.sh"), true),
+            bind("/etc/inittab", &dir.join("inittab"), true),
             bind("/etc/resolv.conf", &dir.join("etc/resolv.conf"), true),
             bind("/etc/hosts", &dir.join("etc/hosts"), true),
             bind("/etc/hostname", &dir.join("etc/hostname"), true)
@@ -229,17 +239,17 @@ mod tests {
             .unwrap();
         assert!(!caps.contains(&json!("CAP_NET_RAW")));
         assert!(!caps.contains(&json!("CAP_SYS_ADMIN")));
-        assert!(config["process"]["env"]
-            .as_array()
-            .unwrap()
-            .contains(&json!("AENV_ENVD_PORT=49983")));
+        assert_eq!(config["process"]["args"], json!(["/agentenv/bin/busybox", "init"]));
     }
 
     #[test]
     fn writes_bundle_files() -> Result<()> {
         let temp = tempfile::tempdir()?;
         write_bundle(&spec(temp.path()))?;
-        assert!(fs::read_to_string(temp.path().join("init.sh"))?.contains("-isnotfc"));
+        assert!(fs::read_to_string(temp.path().join("init.sh"))?.contains("/etc/passwd"));
+        let inittab = fs::read_to_string(temp.path().join("inittab"))?;
+        assert!(inittab.contains("::sysinit:/agentenv/bin/busybox sh /.aenv-init"));
+        assert!(inittab.contains("::respawn:/agentenv/envd -isnotfc -port 49983"));
         assert_eq!(
             fs::read_to_string(temp.path().join("etc/resolv.conf"))?,
             "nameserver 10.0.0.53\n"

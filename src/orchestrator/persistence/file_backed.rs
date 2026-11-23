@@ -782,8 +782,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn load_all_keeps_paused_records_of_backends_this_node_does_not_run(
-    ) -> anyhow::Result<()> {
+    async fn load_all_keeps_paused_records_of_backends_this_node_does_not_run() -> anyhow::Result<()>
+    {
         let temp = TempDir::new()?;
         let persister = test_persister(temp.path());
         let sandbox_id = SandboxId::new();
