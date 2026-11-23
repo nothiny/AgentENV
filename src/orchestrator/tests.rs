@@ -6414,7 +6414,6 @@ async fn running_container_sandbox() -> Result<(Arc<TestOrchestrator>, SandboxMe
         MockOperation::Pause,
         MockOperation::Snapshot,
         MockOperation::Fork,
-        MockOperation::UpdateNetwork,
     ] {
         behavior.set_on_operation(
             operation,
@@ -6475,13 +6474,6 @@ async fn container_sandboxes_reject_unsupported_operations_without_side_effects(
             .await
             .unwrap_err(),
         BackendCapability::Fork,
-    );
-    assert_unsupported(
-        orchestrator
-            .replace_sandbox_network_policy(id, SandboxNetworkPolicy::default())
-            .await
-            .unwrap_err(),
-        BackendCapability::UpdateNetwork,
     );
     assert_unsupported(
         orchestrator

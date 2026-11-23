@@ -9,9 +9,10 @@
 //! Requires the server to run as root: rootful OCI runtimes need the full
 //! capability set, which the non-root systemd unit does not grant.
 //!
-//! Supported: cold start, exec, files, proxy, delete. Pause, snapshot, fork,
-//! volumes, attached drives and egress rules are rejected before they reach
-//! this backend (see `SandboxBackendKind::supports`).
+//! Supported: cold start, exec, files, proxy, delete, egress rules and
+//! network policy updates. Pause, snapshot, fork, volumes and attached drives
+//! are rejected before they reach this backend (see
+//! `SandboxBackendKind::supports`).
 
 mod bundle;
 mod netns;
@@ -647,8 +648,17 @@ impl SandboxBackend for ContainerSandbox {
             .clone()])
     }
 
-    async fn update_network_policy(&mut self, _policy: Option<SandboxNetworkPolicy>) -> Result<()> {
-        self.unsupported("network policy updates")
+    async fn update_network_policy(&mut self, policy: Option<SandboxNetworkPolicy>) -> Result<()> {
+        match self.slot.as_mut() {
+            Some(slot) => {
+                slot.set_egress_policy(policy.as_ref())
+                    .context("configure sandbox network policy")?;
+            }
+            None if policy.is_some() => bail!("sandbox has no active network slot"),
+            None => {}
+        }
+        self.network_policy = policy;
+        Ok(())
     }
 
     fn update_custom_extension_params(&mut self, params: Option<CustomExtensionParams>) {

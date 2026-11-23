@@ -2974,8 +2974,13 @@ mod cold_start_backend_tests {
                 Box::new(|b| b.extra_boot_args = Some("x=1".to_string())),
             ),
             (
-                "allowInternetAccess",
-                Box::new(|b| b.allow_internet_access = Some(false)),
+                "volumeMounts",
+                Box::new(|b| {
+                    b.volume_mounts = Some(vec![models::SandboxVolumeMount::new(
+                        "v".to_string(),
+                        "/data".to_string(),
+                    )])
+                }),
             ),
             (
                 "customExtensionParams",
@@ -3001,7 +3006,12 @@ mod cold_start_backend_tests {
         let mut request = body(Some(models::SandboxBackend::Container));
         request.auto_pause = Some(false);
         request.extra_boot_args = Some("  ".to_string());
-        request.allow_internet_access = Some(true);
+        request.volume_mounts = Some(Vec::new());
+        assert!(cold_start_backend(&request, BOTH).is_ok());
+
+        // Egress rules are supported.
+        let mut request = body(Some(models::SandboxBackend::Container));
+        request.allow_internet_access = Some(false);
         assert!(cold_start_backend(&request, BOTH).is_ok());
     }
 }

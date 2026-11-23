@@ -57,6 +57,9 @@ impl SandboxBackendKind {
         match self {
             Self::Firecracker => true,
             Self::Container => match capability {
+                // The slot's egress rules match the container's veth, which
+                // keeps the name tap0.
+                BackendCapability::EgressRules | BackendCapability::UpdateNetwork => true,
                 BackendCapability::Pause
                 | BackendCapability::Snapshot
                 | BackendCapability::SnapshotRestore
@@ -64,8 +67,6 @@ impl SandboxBackendKind {
                 | BackendCapability::ManagedVolumes
                 | BackendCapability::AttachedDrives
                 | BackendCapability::ExtraBootArgs
-                | BackendCapability::EgressRules
-                | BackendCapability::UpdateNetwork
                 | BackendCapability::CustomExtension => false,
             },
         }
@@ -140,7 +141,7 @@ mod tests {
     }
 
     #[test]
-    fn firecracker_supports_everything_and_container_starts_minimal() {
+    fn firecracker_supports_everything_and_container_a_subset() {
         use BackendCapability::*;
         let all = [
             Pause,
@@ -154,9 +155,13 @@ mod tests {
             UpdateNetwork,
             CustomExtension,
         ];
+        let container: Vec<_> = all
+            .into_iter()
+            .filter(|capability| SandboxBackendKind::Container.supports(*capability))
+            .collect();
         for capability in all {
             assert!(SandboxBackendKind::Firecracker.supports(capability));
-            assert!(!SandboxBackendKind::Container.supports(capability));
         }
+        assert_eq!(container, vec![EgressRules, UpdateNetwork]);
     }
 }
