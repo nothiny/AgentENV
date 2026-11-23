@@ -6,6 +6,7 @@ RUN apt-get update \
  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
       runc crun iptables iproute2 e2fsprogs util-linux kmod jq busybox-static \
       uidmap strace psmisc curl ca-certificates \
+      nodejs npm default-jre-headless umoci zstd \
  && rm -rf /var/lib/apt/lists/*
 # overlaybd-apply validates its built-in default config path (see deploy/docker/Dockerfile.agentenv).
 RUN mkdir -p /etc/overlaybd && printf '{}\n' > /etc/overlaybd/overlaybd.json
