@@ -2715,6 +2715,24 @@ where
                                                   let mut response = response.status(204);
                                                   response.body(Body::empty())
                                                 },
+                                                apis::sandboxes::SandboxesSandboxIdPausePostResponse::Status400_BadRequest
+                                                    (body)
+                                                => {
+                                                  let mut response = response.status(400);
+                                                  {
+                                                    let mut response_headers = response.headers_mut().unwrap();
+                                                    response_headers.insert(
+                                                        CONTENT_TYPE,
+                                                        HeaderValue::from_static("application/json"));
+                                                  }
+
+                                                  let body_content =  tokio::task::spawn_blocking(move ||
+                                                      serde_json::to_vec(&body).map_err(|e| {
+                                                        error!(error = ?e);
+                                                        StatusCode::INTERNAL_SERVER_ERROR
+                                                      })).await.unwrap()?;
+                                                  response.body(Body::from(body_content))
+                                                },
                                                 apis::sandboxes::SandboxesSandboxIdPausePostResponse::Status409_Conflict
                                                     (body)
                                                 => {

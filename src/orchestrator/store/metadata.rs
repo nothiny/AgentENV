@@ -10,7 +10,7 @@ use crate::orchestrator::SandboxState;
 use crate::sandbox::CustomExtensionParams;
 use crate::sandbox::{PausedSandboxState, SandboxNetworkPolicy};
 use crate::snapshot::{CommandContext, SnapshotRuntimeVersions, StartupCommand};
-use crate::types::{ImageConfigs, SandboxId, SandboxResources};
+use crate::types::{ImageConfigs, SandboxBackendKind, SandboxId, SandboxResources};
 use crate::virtualization::VirtualizationMode;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -44,6 +44,10 @@ pub struct SandboxMetadata {
     /// Virtualization mode used by this sandbox for its entire lifecycle.
     #[serde(default)]
     pub virtualization_mode: VirtualizationMode,
+    /// Runtime that executes this sandbox for its entire lifecycle. Records
+    /// written before backends existed are Firecracker sandboxes.
+    #[serde(default)]
+    pub backend: SandboxBackendKind,
     pub runtime_versions: SnapshotRuntimeVersions,
     pub resources: SandboxResources,
     pub context: CommandContext,
@@ -84,6 +88,7 @@ impl Default for SandboxMetadata {
             expires_at: None,
             auto_resume: false,
             virtualization_mode: VirtualizationMode::default(),
+            backend: SandboxBackendKind::default(),
             runtime_versions: SnapshotRuntimeVersions::new(
                 "unknown".to_string(),
                 "unknown".to_string(),

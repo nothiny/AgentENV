@@ -13,6 +13,8 @@ use crate::types::{ImageConfigs, SandboxId, SandboxResources};
 pub enum SandboxLaunchSource {
     Snapshot(Box<crate::snapshot::RunnableSnapshot>),
     Image {
+        /// Runtime that executes the sandbox.
+        backend: crate::types::SandboxBackendKind,
         image_ref: String,
         overlaybd_config_path: PathBuf,
         context: Box<CommandContext>,

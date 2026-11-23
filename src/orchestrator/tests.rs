@@ -37,7 +37,9 @@ use crate::sandbox::{
     SandboxRuntimeInfo,
 };
 use crate::snapshot::RunnableSnapshot;
-use crate::types::{ImageConfigs, SandboxId, SandboxResources};
+use crate::types::{
+    BackendCapability, ImageConfigs, SandboxBackendKind, SandboxId, SandboxResources,
+};
 
 const STATE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
@@ -1227,6 +1229,7 @@ async fn create_sandbox_from_image_uses_fresh_launch_metadata() -> Result<()> {
     let created = orchestrator
         .create_sandbox(CreateSandboxRequest {
             source: SandboxLaunchSource::Image {
+                backend: SandboxBackendKind::Firecracker,
                 image_ref: "ubuntu:24.04".to_string(),
                 overlaybd_config_path: PathBuf::from("/tmp/ubuntu-image.json"),
                 context: Default::default(),
@@ -6398,5 +6401,201 @@ async fn sandbox_logs_filters_inherited_history_and_does_not_hold_runtime_lock()
     );
     release.notify_one();
     assert!(task.await.unwrap()?.is_empty());
+    Ok(())
+}
+
+// ---- backend capabilities ---------------------------------------------------
+
+/// A running sandbox relabelled as a container sandbox, plus a mock behavior
+/// that fails the test if any VM-state operation reaches the backend.
+async fn running_container_sandbox() -> Result<(Arc<TestOrchestrator>, SandboxMetadata)> {
+    let behavior = Arc::new(MockBehavior::new());
+    for operation in [
+        MockOperation::Pause,
+        MockOperation::Snapshot,
+        MockOperation::Fork,
+        MockOperation::UpdateNetwork,
+    ] {
+        behavior.set_on_operation(
+            operation,
+            Arc::new(move || panic!("{operation:?} reached a container sandbox")),
+        );
+    }
+    let orchestrator = make_orchestrator_without_background_with_factory(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::with_behavior(behavior),
+    );
+    let created = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?;
+    relabel_as_container(&orchestrator.store, created.id).await?;
+    let metadata = orchestrator
+        .get_sandbox(&created.id)
+        .await?
+        .expect("created sandbox");
+    Ok((orchestrator, metadata))
+}
+
+async fn relabel_as_container(store: &impl MetadataStore, id: SandboxId) -> Result<()> {
+    store
+        .update_if_state(&id, &[SandboxState::Running], |metadata| {
+            metadata.backend = SandboxBackendKind::Container;
+        })
+        .await?;
+    Ok(())
+}
+
+fn assert_unsupported(err: OrchestratorError, expected: BackendCapability) {
+    match err {
+        OrchestratorError::UnsupportedCapability {
+            backend: SandboxBackendKind::Container,
+            capability,
+        } if capability == expected => {}
+        other => panic!("expected unsupported {expected:?}, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn container_sandboxes_reject_unsupported_operations_without_side_effects() -> Result<()> {
+    setup();
+    let (orchestrator, sandbox) = running_container_sandbox().await?;
+    let id = sandbox.id;
+
+    assert_unsupported(
+        orchestrator.pause_sandbox(id).await.unwrap_err(),
+        BackendCapability::Pause,
+    );
+    assert_unsupported(
+        orchestrator.capture_snapshot(id).await.unwrap_err(),
+        BackendCapability::Snapshot,
+    );
+    assert_unsupported(
+        orchestrator
+            .fork_sandbox(id, 1, NewTimeout::UseExisting)
+            .await
+            .unwrap_err(),
+        BackendCapability::Fork,
+    );
+    assert_unsupported(
+        orchestrator
+            .replace_sandbox_network_policy(id, SandboxNetworkPolicy::default())
+            .await
+            .unwrap_err(),
+        BackendCapability::UpdateNetwork,
+    );
+    assert_unsupported(
+        orchestrator
+            .patch_sandbox_custom_extension_params(id, serde_json::Map::new())
+            .await
+            .unwrap_err(),
+        BackendCapability::CustomExtension,
+    );
+    assert!(orchestrator
+        .pause_sandbox(id)
+        .await
+        .unwrap_err()
+        .is_backend_rejection());
+
+    let current = orchestrator.get_sandbox(&id).await?.expect("still present");
+    assert_eq!(current.state, SandboxState::Running);
+    assert_proxy_ready(&orchestrator, &id).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn expired_container_sandbox_is_deleted_even_with_a_pause_action() -> Result<()> {
+    setup();
+    let (orchestrator, sandbox) = running_container_sandbox().await?;
+    assert!(matches!(
+        sandbox.timeout_action,
+        SandboxTimeoutAction::Pause
+    ));
+    orchestrator
+        .store
+        .update_if_state(&sandbox.id, &[SandboxState::Running], |metadata| {
+            metadata.expires_at = Some(SystemTime::now() - Duration::from_secs(1));
+        })
+        .await?;
+
+    assert_eq!(
+        orchestrator.evict_expired_sandboxes().await?,
+        vec![sandbox.id]
+    );
+    assert!(orchestrator.get_sandbox(&sandbox.id).await?.is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn shutdown_deletes_container_sandboxes_and_pauses_firecracker_ones() -> Result<()> {
+    setup();
+    let persister = RecordingPersister::default();
+    let orchestrator = make_orchestrator_without_background_with_factory_and_persister(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::new(),
+        persister.clone(),
+    );
+    let firecracker = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?;
+    let container = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?;
+    relabel_as_container(&orchestrator.store, container.id).await?;
+
+    orchestrator.shutdown().await?;
+
+    assert!(orchestrator.get_sandbox(&container.id).await?.is_none());
+    let paused = orchestrator
+        .get_sandbox(&firecracker.id)
+        .await?
+        .expect("firecracker sandbox survives shutdown");
+    assert_eq!(paused.state, SandboxState::Paused);
+    let calls = persister.calls();
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|call| matches!(call, RecordingCall::PersistPaused))
+            .count(),
+        1,
+        "only the firecracker sandbox is paused: {calls:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn create_rejects_a_backend_the_node_does_not_run() -> Result<()> {
+    setup();
+    let behavior = Arc::new(MockBehavior::new());
+    behavior.set_on_operation(
+        MockOperation::Build,
+        Arc::new(|| panic!("a disabled backend must not build")),
+    );
+    let orchestrator = make_orchestrator_without_background_with_factory(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::with_behavior(behavior),
+    );
+    let mut request = create_request(Some(60), &[]);
+    request.source = SandboxLaunchSource::Image {
+        backend: SandboxBackendKind::Container,
+        image_ref: "ubuntu:24.04".to_string(),
+        overlaybd_config_path: PathBuf::from("/tmp/ubuntu-image.json"),
+        context: Default::default(),
+        resources: None,
+        extra_drives: Vec::new(),
+        extra_boot_args: None,
+        image_configs: Box::new(ImageConfigs::new()),
+    };
+
+    let err = orchestrator.create_sandbox(request).await.unwrap_err();
+    assert!(
+        matches!(
+            err,
+            OrchestratorError::BackendNotEnabled {
+                backend: SandboxBackendKind::Container
+            }
+        ),
+        "{err:?}"
+    );
+    assert!(orchestrator.list_sandboxes().await?.is_empty());
     Ok(())
 }

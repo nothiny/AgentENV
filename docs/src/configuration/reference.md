@@ -16,6 +16,7 @@ cargo run --bin server -- --config /path/to/config.toml
 | `runtime_path` | string | `"/run/aenv"` | Base directory for transient namespace and daemon-socket state. Overridden by `AENV_RUNTIME_PATH` |
 | `deps_path` | string | `"$AENV_HOME/deps"` | Root directory for auto-downloaded runtime assets. Overridden by `AENV_DEPS_PATH` |
 | `virtualization_mode` | `"kvm"` or `"pvm"` | `"kvm"` | Virtualization mode for this node. Keep the default unless following the [PVM Deployment](../deployment/pvm.md) guide. Overridden by `AENV_VIRTUALIZATION_MODE` |
+| `enabled_backends` | array of `"firecracker"`, `"container"` | `["firecracker"]` | Sandbox backends this node runs. A create request selects one with `backend`; requests that omit it use Firecracker. Must be non-empty without duplicates |
 
 Snapshots and paused sandboxes can only be restored in the mode in which they
 were created.
@@ -31,6 +32,14 @@ Packaged runtime dependency versions and download URLs live in
 `config/deps_manifest.toml`. Only the dependencies for the selected mode are
 installed. User configuration should contain runtime behavior and explicit
 local path overrides, not the default dependency catalog.
+
+## `[container]`
+
+Read only when `"container"` is in `enabled_backends`.
+
+| Key | Type | Default | Description |
+| --- | --- | --- | --- |
+| `runtime` | string | `"runc"` | OCI runtime executable used by the container backend: `runc`, `crun`, `runsc`, or an absolute path |
 
 ## `[firecracker]`
 

@@ -5,6 +5,7 @@ mod image_tag;
 mod overlaybd_layer;
 mod resources;
 mod runtime_artifacts;
+mod sandbox_backend;
 mod snapshot_id;
 mod volume_mode;
 
@@ -19,6 +20,7 @@ pub use image_tag::{ImageName, ImageTag, DEFAULT_IMAGE_TAG};
 pub use overlaybd_layer::{ExternalLayer, ManagedLayer, OverlaybdLayerRef};
 pub use resources::{bytes_to_mib_ceil, SandboxResources};
 pub use runtime_artifacts::RuntimeArtifactSet;
+pub use sandbox_backend::{BackendCapability, SandboxBackendKind};
 pub use snapshot_id::{SnapshotAlias, SnapshotId};
 pub use volume_mode::VolumeMode;
 

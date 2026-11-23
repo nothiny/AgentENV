@@ -24,7 +24,9 @@ use crate::snapshot::{
     CommittedSnapshot, SnapshotAlias, SnapshotId, SnapshotPublishMetadata, SnapshotPublishSource,
     SnapshotVolume,
 };
-use crate::types::{ImageConfigs, SandboxId, SandboxResources};
+use crate::types::{
+    BackendCapability, ImageConfigs, SandboxBackendKind, SandboxId, SandboxResources,
+};
 use crate::volume::{VolumeManager, VolumeMode};
 use agentenv_http_server::apis::sandboxes::*;
 use agentenv_http_server::models;
@@ -97,9 +99,108 @@ impl From<OrchestratorError> for models::Error {
                 ),
             ),
             OrchestratorError::SandboxOperationConflict { .. } => Self::new(409, err.to_string()),
+            OrchestratorError::BackendNotEnabled { .. } => {
+                with_reason(Self::new(400, err.to_string()), "backend_not_enabled")
+            }
+            OrchestratorError::UnsupportedCapability { .. } => {
+                with_reason(Self::new(400, err.to_string()), "unsupported_capability")
+            }
             other => ApiImpl::internal_error(&other),
         }
     }
+}
+
+fn with_reason(mut error: models::Error, reason: &str) -> models::Error {
+    error.reason = Some(reason.to_owned());
+    error
+}
+
+impl From<SandboxBackendKind> for models::SandboxBackend {
+    fn from(backend: SandboxBackendKind) -> Self {
+        match backend {
+            SandboxBackendKind::Firecracker => Self::Firecracker,
+            SandboxBackendKind::Container => Self::Container,
+        }
+    }
+}
+
+impl From<models::SandboxBackend> for SandboxBackendKind {
+    fn from(backend: models::SandboxBackend) -> Self {
+        match backend {
+            models::SandboxBackend::Firecracker => Self::Firecracker,
+            models::SandboxBackend::Container => Self::Container,
+        }
+    }
+}
+
+/// Backend checks for a cold start, run before the image is resolved or any
+/// drive or volume is reserved. Returns the backend and its timeout action:
+/// an omitted `autoPause` pauses only on backends that can.
+fn cold_start_backend(
+    body: &models::NewColdSandbox,
+    enabled_backends: &[SandboxBackendKind],
+) -> Result<(SandboxBackendKind, SandboxTimeoutAction), models::Error> {
+    let backend = body
+        .backend
+        .map(SandboxBackendKind::from)
+        .unwrap_or_default();
+    if !enabled_backends.contains(&backend) {
+        return Err(OrchestratorError::BackendNotEnabled { backend }.into());
+    }
+    let has_egress_rules =
+        network_policy_from_create(body.allow_internet_access, body.network.as_ref())
+            .is_ok_and(|policy| policy.has_runtime_egress_rules());
+    let requested = [
+        (body.auto_pause == Some(true), BackendCapability::Pause),
+        (
+            body.auto_resume
+                .as_ref()
+                .is_some_and(|config| config.enabled),
+            BackendCapability::Pause,
+        ),
+        (
+            body.volume_mounts
+                .as_ref()
+                .is_some_and(|mounts| !mounts.is_empty()),
+            BackendCapability::ManagedVolumes,
+        ),
+        (
+            body.attached_drives
+                .as_ref()
+                .is_some_and(|drives| !drives.is_empty()),
+            BackendCapability::AttachedDrives,
+        ),
+        (
+            body.extra_boot_args
+                .as_ref()
+                .is_some_and(|args| !args.trim().is_empty()),
+            BackendCapability::ExtraBootArgs,
+        ),
+        (
+            body.custom_extension_params
+                .as_ref()
+                .is_some_and(|params| !params.is_empty()),
+            BackendCapability::CustomExtension,
+        ),
+        (has_egress_rules, BackendCapability::EgressRules),
+    ];
+    if let Some((_, capability)) = requested
+        .into_iter()
+        .find(|(requested, capability)| *requested && !backend.supports(*capability))
+    {
+        return Err(OrchestratorError::UnsupportedCapability {
+            backend,
+            capability,
+        }
+        .into());
+    }
+    let timeout_action = match body.auto_pause {
+        Some(true) => SandboxTimeoutAction::Pause,
+        Some(false) => SandboxTimeoutAction::Delete,
+        None if backend.supports(BackendCapability::Pause) => SandboxTimeoutAction::Pause,
+        None => SandboxTimeoutAction::Delete,
+    };
+    Ok((backend, timeout_action))
 }
 
 impl From<SandboxState> for models::SandboxState {
@@ -433,6 +534,7 @@ impl From<SandboxMetadata> for models::ListedSandbox {
             state: m.state.into(),
             envd_version: m.runtime_versions.envd_version.clone(),
             volume_mounts: Some(volume_mounts_model(&m.volume_mounts)),
+            backend: Some(m.backend.into()),
         }
     }
 }
@@ -448,6 +550,7 @@ impl From<SandboxMetadata> for models::Sandbox {
             envd_access_token: None,
             traffic_access_token: None,
             domain: None,
+            backend: Some(m.backend.into()),
         }
     }
 }
@@ -525,6 +628,7 @@ impl From<SandboxMetadata> for models::SandboxDetail {
                 on_timeout: m.timeout_action.into(),
             }),
             volume_mounts: Some(volume_mounts_model(&m.volume_mounts)),
+            backend: Some(m.backend.into()),
         }
     }
 }
@@ -959,6 +1063,9 @@ impl ApiImpl {
                         400, message,
                     )));
                 }
+                if err.is_backend_rejection() {
+                    return Ok(SandboxesPostResponse::Status400_BadRequest(err.into()));
+                }
                 Ok(SandboxesPostResponse::Status500_ServerError(
                     Self::internal_error(&err),
                 ))
@@ -979,6 +1086,11 @@ impl Sandboxes<()> for ApiImpl {
         _claims: &Self::Claims,
         body: &models::NewColdSandbox,
     ) -> Result<SandboxesColdPostResponse, ()> {
+        let enabled_backends = &ConfigManager::global_config().enabled_backends;
+        let (backend, timeout_action) = match cold_start_backend(body, enabled_backends) {
+            Ok(selected) => selected,
+            Err(error) => return Ok(SandboxesColdPostResponse::Status400_BadRequest(error)),
+        };
         let image_resolver = self.image_resolver();
         let timer = SandboxStageTimer::new("create_cold");
         // TODO: Move cold-start image resolution into an async create operation
@@ -1077,6 +1189,7 @@ impl Sandboxes<()> for ApiImpl {
 
         let request = CreateSandboxRequest {
             source: SandboxLaunchSource::Image {
+                backend,
                 image_ref: resolved_rootfs.image_ref,
                 overlaybd_config_path: resolved_rootfs.overlaybd_config_path,
                 context: Box::new(resolved_rootfs.base_context.into()),
@@ -1088,10 +1201,7 @@ impl Sandboxes<()> for ApiImpl {
             extra_drives: Vec::new(),
             extra_drives_in_snapshot: false,
             timeout: duration_from_secs(body.timeout),
-            timeout_action: match body.auto_pause {
-                Some(false) => SandboxTimeoutAction::Delete,
-                _ => SandboxTimeoutAction::Pause,
-            },
+            timeout_action,
             auto_resume: body.auto_resume.as_ref().is_some_and(|cfg| cfg.enabled),
             user_metadata: body.metadata.clone(),
             env_vars: body
@@ -1808,6 +1918,9 @@ impl Sandboxes<()> for ApiImpl {
                     Self::error(409, err.to_string()),
                 ))
             }
+            Err(err) if err.is_backend_rejection() => Ok(
+                SandboxesSandboxIdNetworkPutResponse::Status400_BadRequest(err.into()),
+            ),
             Err(err) => Ok(SandboxesSandboxIdNetworkPutResponse::Status500_ServerError(err.into())),
         }
     }
@@ -1891,6 +2004,11 @@ impl Sandboxes<()> for ApiImpl {
                     Self::error(409, err.to_string()),
                 ),
             ),
+            Err(err) if err.is_backend_rejection() => Ok(
+                SandboxesSandboxIdCustomExtensionParamsPatchResponse::Status400_BadRequest(
+                    err.into(),
+                ),
+            ),
             // The extension rejected the patch (4xx), the extension itself
             // failed (5xx), or no extension is configured.
             Err(err @ OrchestratorError::SandboxOperationFailed { .. }) => {
@@ -1943,6 +2061,9 @@ impl Sandboxes<()> for ApiImpl {
                     409,
                     format!("sandbox cannot be paused from {} state", state),
                 )),
+            ),
+            Err(err) if err.is_backend_rejection() => Ok(
+                SandboxesSandboxIdPausePostResponse::Status400_BadRequest(err.into()),
             ),
             Err(err) => Ok(SandboxesSandboxIdPausePostResponse::Status500_ServerError(
                 err.into(),
@@ -2750,6 +2871,129 @@ fn parse_metrics_ids(values: &[String]) -> Result<Vec<SandboxId>, &'static str> 
         parsed.push(id);
     }
     Ok(parsed)
+}
+
+#[cfg(test)]
+mod cold_start_backend_tests {
+    use super::*;
+
+    type SetField = dyn Fn(&mut models::NewColdSandbox);
+
+    const BOTH: &[SandboxBackendKind] = &[
+        SandboxBackendKind::Firecracker,
+        SandboxBackendKind::Container,
+    ];
+
+    fn body(backend: Option<models::SandboxBackend>) -> models::NewColdSandbox {
+        let mut body = models::NewColdSandbox::new("ubuntu:24.04".to_string());
+        // `new` fills in schema defaults; a request that omits a field
+        // deserializes to None.
+        body.auto_pause = None;
+        body.backend = backend;
+        body
+    }
+
+    fn rejection(
+        result: Result<(SandboxBackendKind, SandboxTimeoutAction), models::Error>,
+    ) -> (i32, String) {
+        let error = result.expect_err("expected a rejection");
+        (error.code, error.reason.unwrap_or_default())
+    }
+
+    #[test]
+    fn omitted_backend_is_firecracker_with_its_existing_defaults() {
+        let (backend, action) =
+            cold_start_backend(&body(None), &[SandboxBackendKind::Firecracker]).unwrap();
+        assert_eq!(backend, SandboxBackendKind::Firecracker);
+        assert!(matches!(action, SandboxTimeoutAction::Pause));
+
+        let mut no_pause = body(None);
+        no_pause.auto_pause = Some(false);
+        let (_, action) =
+            cold_start_backend(&no_pause, &[SandboxBackendKind::Firecracker]).unwrap();
+        assert!(matches!(action, SandboxTimeoutAction::Delete));
+    }
+
+    #[test]
+    fn firecracker_accepts_every_capability() {
+        let mut request = body(Some(models::SandboxBackend::Firecracker));
+        request.auto_pause = Some(true);
+        request.extra_boot_args = Some("aenv-custom.x=1".to_string());
+        request.allow_internet_access = Some(false);
+        assert!(cold_start_backend(&request, BOTH).is_ok());
+    }
+
+    #[test]
+    fn rejects_a_backend_the_node_does_not_run() {
+        assert_eq!(
+            rejection(cold_start_backend(
+                &body(Some(models::SandboxBackend::Container)),
+                &[SandboxBackendKind::Firecracker],
+            )),
+            (400, "backend_not_enabled".to_string())
+        );
+        assert_eq!(
+            rejection(cold_start_backend(
+                &body(None),
+                &[SandboxBackendKind::Container]
+            )),
+            (400, "backend_not_enabled".to_string())
+        );
+    }
+
+    #[test]
+    fn container_defaults_to_delete_on_timeout() {
+        let (backend, action) =
+            cold_start_backend(&body(Some(models::SandboxBackend::Container)), BOTH).unwrap();
+        assert_eq!(backend, SandboxBackendKind::Container);
+        assert!(matches!(action, SandboxTimeoutAction::Delete));
+    }
+
+    #[test]
+    fn container_rejects_capabilities_it_lacks() {
+        let cases: Vec<(&str, Box<SetField>)> = vec![
+            ("autoPause", Box::new(|b| b.auto_pause = Some(true))),
+            (
+                "autoResume",
+                Box::new(|b| {
+                    b.auto_resume = Some(models::SandboxAutoResumeConfig { enabled: true })
+                }),
+            ),
+            (
+                "extraBootArgs",
+                Box::new(|b| b.extra_boot_args = Some("x=1".to_string())),
+            ),
+            (
+                "allowInternetAccess",
+                Box::new(|b| b.allow_internet_access = Some(false)),
+            ),
+            (
+                "customExtensionParams",
+                Box::new(|b| {
+                    b.custom_extension_params = Some(HashMap::from([(
+                        "k".to_string(),
+                        agentenv_http_server::types::Object(serde_json::json!("v")),
+                    )]))
+                }),
+            ),
+        ];
+        for (field, set) in cases {
+            let mut request = body(Some(models::SandboxBackend::Container));
+            set(&mut request);
+            assert_eq!(
+                rejection(cold_start_backend(&request, BOTH)),
+                (400, "unsupported_capability".to_string()),
+                "{field}"
+            );
+        }
+
+        // Explicitly empty or disabled values request nothing.
+        let mut request = body(Some(models::SandboxBackend::Container));
+        request.auto_pause = Some(false);
+        request.extra_boot_args = Some("  ".to_string());
+        request.allow_internet_access = Some(true);
+        assert!(cold_start_backend(&request, BOTH).is_ok());
+    }
 }
 
 #[cfg(test)]

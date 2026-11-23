@@ -35,7 +35,7 @@ pub(crate) async fn test_api(
     let record = manager.publish(metadata, manifest, None).await?;
     let orchestrator = Orchestrator::new(
         InMemoryMetadataStore::new(),
-        FirecrackerSandboxFactory::new(),
+        crate::sandbox::BackendRegistry::firecracker(FirecrackerSandboxFactory::new()),
         FileBackedSandboxPersister::new_for_test(root.path().join("sandboxes")),
     )
     .await?;

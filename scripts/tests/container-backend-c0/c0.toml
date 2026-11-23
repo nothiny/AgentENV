@@ -23,6 +23,9 @@ home_path = "/var/lib/aenv"
 # AENV_VIRTUALIZATION_MODE overrides this value.
 virtualization_mode = "kvm"
 
+# Sandbox backends this node runs: "firecracker" and/or "container".
+enabled_backends = ["firecracker"]
+
 [firecracker]
 # Use an existing Firecracker executable instead of downloading one. It must
 # be a readable, non-empty, executable regular file.

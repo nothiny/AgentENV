@@ -192,6 +192,17 @@ components:
         - running
         - paused
 
+    SandboxBackend:
+      type: string
+      description: >
+        Runtime that executes the sandbox. `firecracker` runs a microVM;
+        `container` runs an OCI container on the same rootfs and network, with
+        fewer capabilities. A node accepts only the backends listed in its
+        `enabled_backends`.
+      enum:
+        - firecracker
+        - container
+
     OrderDirection:
       type: string
       description: Sort direction
@@ -505,6 +516,8 @@ components:
           type: string
           deprecated: true
           description: Identifier of the client
+        backend:
+          $ref: "#/components/schemas/SandboxBackend"
         envdVersion:
           $ref: "#/components/schemas/EnvdVersion"
         envdAccessToken:
@@ -545,6 +558,8 @@ components:
           type: string
           deprecated: true
           description: Identifier of the client
+        backend:
+          $ref: "#/components/schemas/SandboxBackend"
         startedAt:
           type: string
           format: date-time
@@ -611,6 +626,8 @@ components:
           type: string
           deprecated: true
           description: Identifier of the client
+        backend:
+          $ref: "#/components/schemas/SandboxBackend"
         startedAt:
           type: string
           format: date-time
@@ -770,6 +787,14 @@ components:
             configured shared repository.
             Cold starts may pull and convert OCI layers on a cache miss and can
             take tens of seconds.
+        backend:
+          allOf:
+            - $ref: "#/components/schemas/SandboxBackend"
+          description: >
+            Runtime for the sandbox; omitted means `firecracker`. Requests for
+            a backend the node does not run, or for capabilities the backend
+            lacks, return HTTP 400 before any resources are allocated. For
+            `container`, `autoPause` defaults to false and may not be true.
         timeout:
           type: integer
           format: int32
@@ -1636,6 +1661,11 @@ components:
         message:
           type: string
           description: Error
+        reason:
+          type: string
+          description: >
+            Machine-readable cause, when one is defined: `backend_not_enabled`
+            or `unsupported_capability`.
 
     Volume:
       type: object
@@ -2206,6 +2236,8 @@ paths:
       responses:
         "204":
           description: The sandbox was paused successfully and can be resumed
+        "400":
+          $ref: "#/components/responses/400"
         "409":
           $ref: "#/components/responses/409"
         "404":

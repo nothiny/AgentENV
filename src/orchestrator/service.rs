@@ -15,14 +15,16 @@ use crate::image::cache::{
     local_image_services_from_global_config, RuntimeImageOwner, RuntimeImageRefs,
 };
 use crate::sandbox::{
-    CustomExtensionClient, CustomExtensionParams, EnvdAccessToken, EnvdApi,
+    BackendRegistry, CustomExtensionClient, CustomExtensionParams, EnvdAccessToken, EnvdApi,
     FirecrackerSandboxFactory, FreshSandboxBuildSpec, PausedSandboxState, RuntimeArtifactSet,
     SandboxAccessTokenGenerator, SandboxBackend, SandboxBackendFactory, SandboxCaptureError,
     SandboxForkSpec, SandboxLaunchConfig, SandboxLogEntry, SandboxNetworkPolicy,
     SandboxRuntimeInfo,
 };
 use crate::snapshot::SnapshotRuntimeVersions;
-use crate::types::{bytes_to_mib_ceil, SandboxId, SandboxResources};
+use crate::types::{
+    bytes_to_mib_ceil, BackendCapability, SandboxBackendKind, SandboxId, SandboxResources,
+};
 use crate::volume::VolumeManager;
 
 use super::launch_plan::{CreateLaunchSource, LaunchPlan};
@@ -112,7 +114,7 @@ impl FailedLaunchStage {
 
 pub struct Orchestrator<
     S: MetadataStore = InMemoryMetadataStore,
-    F: SandboxBackendFactory = FirecrackerSandboxFactory,
+    F: SandboxBackendFactory = BackendRegistry,
     P: SandboxPersister = FileBackedSandboxPersister,
 > {
     store: S,
@@ -480,6 +482,27 @@ where
         let envd_access_token = secure.then(|| self.access_tokens.generate(sandbox_id));
         info!(timeout = ?timeout, "creating sandbox");
 
+        let backend = match &source {
+            SandboxLaunchSource::Snapshot(snapshot) => {
+                match snapshot.manifest().backend.parse::<SandboxBackendKind>() {
+                    Ok(backend) => backend,
+                    Err(err) => {
+                        self.counters.record_create_fail(1);
+                        return Err(OrchestratorError::InternalError(format!(
+                            "snapshot {}: {err}",
+                            snapshot.record().id
+                        )));
+                    }
+                }
+            }
+            SandboxLaunchSource::Image { backend, .. } => *backend,
+        };
+        let restores_snapshot = matches!(source, SandboxLaunchSource::Snapshot(_));
+        if let Err(err) = require_backend_for_create(backend, restores_snapshot) {
+            self.counters.record_create_fail(1);
+            return Err(err);
+        }
+
         let result = match source {
             SandboxLaunchSource::Snapshot(snapshot) => {
                 let record = snapshot.record();
@@ -523,6 +546,7 @@ where
                     snapshot_id: record.id.to_string(),
                     snapshot_alias: record.alias.as_ref().map(ToString::to_string),
                     virtualization_mode: committed.virtualization_mode,
+                    backend,
                     runtime_versions: committed.runtime_versions.clone(),
                     resources: *snapshot.resources(),
                     context: committed.context.clone(),
@@ -548,6 +572,7 @@ where
                 .await
             }
             SandboxLaunchSource::Image {
+                backend: _,
                 image_ref,
                 overlaybd_config_path,
                 context,
@@ -577,6 +602,7 @@ where
                     extra_drives_in_snapshot: false,
                 };
                 let build_spec = FreshSandboxBuildSpec {
+                    backend,
                     image_config_path: overlaybd_config_path,
                     context: context.clone(),
                     resources,
@@ -590,6 +616,7 @@ where
                     snapshot_id: image_ref,
                     snapshot_alias: None,
                     virtualization_mode: ConfigManager::global_config().virtualization_mode,
+                    backend,
                     runtime_versions: configured_runtime_versions(),
                     resources,
                     context,
@@ -665,6 +692,8 @@ where
         child_specs: Vec<SandboxForkChildSpec>,
         new_timeout: NewTimeout,
     ) -> Result<Vec<SandboxForkOutcome>> {
+        self.require_capability(source_sandbox_id, BackendCapability::Fork)
+            .await?;
         let this = Arc::clone(self);
         self.run_cancellation_safe("fork", source_sandbox_id, async move {
             this.fork_sandbox_inner(source_sandbox_id, child_specs, new_timeout)
@@ -865,6 +894,25 @@ where
     async fn stop_failed_fork(mut backend: Box<dyn SandboxBackend>, sandbox_id: SandboxId) {
         if let Err(err) = backend.stop().await {
             warn!(%sandbox_id, error = ?err, "failed to stop unsuccessful fork");
+        }
+    }
+
+    /// Fails with [`OrchestratorError::UnsupportedCapability`] when the
+    /// sandbox's backend lacks `capability`. An unknown sandbox passes, so the
+    /// operation itself reports it as not found.
+    async fn require_capability(
+        &self,
+        sandbox_id: SandboxId,
+        capability: BackendCapability,
+    ) -> Result<()> {
+        match self.store.get(&sandbox_id).await? {
+            Some(metadata) if !metadata.backend.supports(capability) => {
+                Err(OrchestratorError::UnsupportedCapability {
+                    backend: metadata.backend,
+                    capability,
+                })
+            }
+            _ => Ok(()),
         }
     }
 
@@ -1410,6 +1458,10 @@ where
         fields(sandbox_id = %sandbox_id)
     )]
     async fn pause_sandbox_inner(self: &Arc<Self>, sandbox_id: SandboxId) -> Result<()> {
+        // Checked here rather than in `pause_sandbox` so shutdown, which calls
+        // this directly, is covered too.
+        self.require_capability(sandbox_id, BackendCapability::Pause)
+            .await?;
         info!("pausing sandbox");
         match self
             .store
@@ -1775,6 +1827,8 @@ where
         self: &Arc<Self>,
         sandbox_id: SandboxId,
     ) -> Result<SnapshotCaptureResult> {
+        self.require_capability(sandbox_id, BackendCapability::Snapshot)
+            .await?;
         let this = Arc::clone(self);
         self.run_cancellation_safe("snapshot", sandbox_id, async move {
             this.capture_snapshot_inner(sandbox_id).await
@@ -1869,6 +1923,8 @@ where
     /// Seals writable persistent-volume uppers without capturing the VM's
     /// rootfs, memory, or device state so callers can clone them locally.
     pub async fn snapshot_volume_mounts(self: &Arc<Self>, sandbox_id: SandboxId) -> Result<()> {
+        self.require_capability(sandbox_id, BackendCapability::ManagedVolumes)
+            .await?;
         let this = Arc::clone(self);
         self.run_cancellation_safe("snapshot_volumes", sandbox_id, async move {
             this.snapshot_volume_mounts_inner(sandbox_id).await
@@ -1944,6 +2000,8 @@ where
         sandbox_id: SandboxId,
         network_policy: SandboxNetworkPolicy,
     ) -> Result<()> {
+        self.require_capability(sandbox_id, BackendCapability::UpdateNetwork)
+            .await?;
         let this = Arc::clone(self);
         self.run_cancellation_safe("update_network", sandbox_id, async move {
             this.replace_sandbox_network_policy_inner(sandbox_id, network_policy)
@@ -2017,6 +2075,8 @@ where
         sandbox_id: SandboxId,
         patch: serde_json::Map<String, serde_json::Value>,
     ) -> Result<Option<CustomExtensionParams>> {
+        self.require_capability(sandbox_id, BackendCapability::CustomExtension)
+            .await?;
         let this = Arc::clone(self);
         self.run_cancellation_safe("patch_custom_extension_params", sandbox_id, async move {
             this.patch_sandbox_custom_extension_params_inner(sandbox_id, patch)
@@ -2278,7 +2338,13 @@ where
         let mut evicted_ids = Vec::new();
 
         for metadata in expired {
-            let claimed_state = match (metadata.state, metadata.timeout_action) {
+            // A backend without pause cannot honor a Pause action; delete instead.
+            let timeout_action = if metadata.backend.supports(BackendCapability::Pause) {
+                metadata.timeout_action
+            } else {
+                SandboxTimeoutAction::Delete
+            };
+            let claimed_state = match (metadata.state, timeout_action) {
                 (SandboxState::Running, SandboxTimeoutAction::Pause) => SandboxState::Pausing,
                 (SandboxState::Running | SandboxState::Paused, SandboxTimeoutAction::Delete) => {
                     SandboxState::Killing
@@ -2292,7 +2358,7 @@ where
                 .claim_expired_sandbox(metadata.id, eviction_cutoff, metadata.state, claimed_state)
                 .await
             {
-                Ok(true) => match metadata.timeout_action {
+                Ok(true) => match timeout_action {
                     SandboxTimeoutAction::Pause => self.pause_sandbox_impl(metadata.id).await,
                     SandboxTimeoutAction::Delete => {
                         self.delete_sandbox_impl(metadata.id, metadata.state, &mut progress)
@@ -2820,7 +2886,11 @@ where
                         unreachable!("paused sandboxes should have been filtered out")
                     }
                     SandboxState::Running => {
-                        let result = if metadata.template_builder {
+                        // Template builders and backends without pause do not
+                        // survive a restart; delete them.
+                        let result = if metadata.template_builder
+                            || !metadata.backend.supports(BackendCapability::Pause)
+                        {
                             self.delete_sandbox_inner(sandbox_id).await
                         } else {
                             self.pause_sandbox_inner(sandbox_id).await
@@ -2972,6 +3042,21 @@ fn persisted_sandboxes_require_managed_seed(persisted: &[SandboxMetadata]) -> bo
     persisted
         .iter()
         .any(|metadata| metadata.secure || !metadata.network_policy.allow_public_traffic)
+}
+
+/// Rejects a create on a backend this node does not run, or a snapshot
+/// launch on a backend that cannot restore snapshots.
+fn require_backend_for_create(backend: SandboxBackendKind, restores_snapshot: bool) -> Result<()> {
+    if !ConfigManager::global_config().backend_enabled(backend) {
+        return Err(OrchestratorError::BackendNotEnabled { backend });
+    }
+    if restores_snapshot && !backend.supports(BackendCapability::SnapshotRestore) {
+        return Err(OrchestratorError::UnsupportedCapability {
+            backend,
+            capability: BackendCapability::SnapshotRestore,
+        });
+    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -1,5 +1,7 @@
 mod access;
 mod backend;
+mod backend_registry;
+mod container;
 #[cfg(test)]
 mod container_c0;
 pub(crate) mod custom_extension;
@@ -38,6 +40,8 @@ pub use backend::{
     SandboxBackendFactory, SandboxCaptureError, SandboxCaptureResult, SandboxExecutor,
     SandboxForkResult, SandboxForkSpec, SandboxRuntimeInfo,
 };
+pub use backend_registry::BackendRegistry;
+pub use container::ContainerSandboxFactory;
 pub use envd::EnvdApi;
 pub(crate) use firecracker::record_startup_pack;
 pub use firecracker::{
@@ -59,6 +63,8 @@ pub use ublk::{OverlaybdConfig, UblkBackend, UblkConfig, UblkDaemonConfig, UblkD
 
 #[derive(Clone, Debug)]
 pub struct FreshSandboxBuildSpec {
+    /// Backend that builds this sandbox; [`BackendRegistry`] dispatches on it.
+    pub backend: crate::types::SandboxBackendKind,
     pub image_config_path: PathBuf,
     pub context: crate::snapshot::CommandContext,
     pub resources: crate::types::SandboxResources,

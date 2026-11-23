@@ -2171,12 +2171,22 @@ pub struct Error {
     #[serde(rename = "message")]
     #[validate(custom(function = "check_xss_string"))]
     pub message: String,
+
+    /// Machine-readable cause, when one is defined: `backend_not_enabled` or `unsupported_capability`.
+    #[serde(rename = "reason")]
+    #[validate(custom(function = "check_xss_string"))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 impl Error {
     #[allow(clippy::new_without_default, clippy::too_many_arguments)]
     pub fn new(code: i32, message: String) -> Error {
-        Error { code, message }
+        Error {
+            code,
+            message,
+            reason: None,
+        }
     }
 }
 
@@ -2190,6 +2200,9 @@ impl std::fmt::Display for Error {
             Some(self.code.to_string()),
             Some("message".to_string()),
             Some(self.message.to_string()),
+            self.reason
+                .as_ref()
+                .map(|reason| ["reason".to_string(), reason.to_string()].join(",")),
         ];
 
         write!(
@@ -2213,6 +2226,7 @@ impl std::str::FromStr for Error {
         struct IntermediateRep {
             pub code: Vec<i32>,
             pub message: Vec<String>,
+            pub reason: Vec<String>,
         }
 
         let mut intermediate_rep = IntermediateRep::default();
@@ -2242,6 +2256,10 @@ impl std::str::FromStr for Error {
                     "message" => intermediate_rep.message.push(
                         <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
                     ),
+                    #[allow(clippy::redundant_clone)]
+                    "reason" => intermediate_rep.reason.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
                     _ => {
                         return std::result::Result::Err(
                             "Unexpected key while parsing Error".to_string(),
@@ -2266,6 +2284,7 @@ impl std::str::FromStr for Error {
                 .into_iter()
                 .next()
                 .ok_or_else(|| "message missing in Error".to_string())?,
+            reason: intermediate_rep.reason.into_iter().next(),
         })
     }
 }
@@ -2758,6 +2777,11 @@ pub struct ListedSandbox {
     #[validate(custom(function = "check_xss_string"))]
     pub client_id: String,
 
+    #[serde(rename = "backend")]
+    #[validate(nested)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backend: Option<models::SandboxBackend>,
+
     /// Time when the sandbox was started
     #[serde(rename = "startedAt")]
     pub started_at: chrono::DateTime<chrono::Utc>,
@@ -2820,6 +2844,7 @@ impl ListedSandbox {
             alias: None,
             sandbox_id,
             client_id,
+            backend: None,
             started_at,
             end_at,
             cpu_count,
@@ -2848,6 +2873,8 @@ impl std::fmt::Display for ListedSandbox {
             Some(self.sandbox_id.to_string()),
             Some("clientID".to_string()),
             Some(self.client_id.to_string()),
+            // Skipping backend in query parameter serialization
+
             // Skipping startedAt in query parameter serialization
 
             // Skipping endAt in query parameter serialization
@@ -2888,6 +2915,7 @@ impl std::str::FromStr for ListedSandbox {
             pub alias: Vec<String>,
             pub sandbox_id: Vec<String>,
             pub client_id: Vec<String>,
+            pub backend: Vec<models::SandboxBackend>,
             pub started_at: Vec<chrono::DateTime<chrono::Utc>>,
             pub end_at: Vec<chrono::DateTime<chrono::Utc>>,
             pub cpu_count: Vec<u32>,
@@ -2933,6 +2961,11 @@ impl std::str::FromStr for ListedSandbox {
                     #[allow(clippy::redundant_clone)]
                     "clientID" => intermediate_rep.client_id.push(
                         <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "backend" => intermediate_rep.backend.push(
+                        <models::SandboxBackend as std::str::FromStr>::from_str(val)
+                            .map_err(|x| x.to_string())?,
                     ),
                     #[allow(clippy::redundant_clone)]
                     "startedAt" => intermediate_rep.started_at.push(
@@ -3007,6 +3040,7 @@ impl std::str::FromStr for ListedSandbox {
                 .into_iter()
                 .next()
                 .ok_or_else(|| "clientID missing in ListedSandbox".to_string())?,
+            backend: intermediate_rep.backend.into_iter().next(),
             started_at: intermediate_rep
                 .started_at
                 .into_iter()
@@ -3568,6 +3602,12 @@ pub struct NewColdSandbox {
     #[validate(custom(function = "check_xss_string"))]
     pub image: String,
 
+    /// Runtime for the sandbox; omitted means `firecracker`. Requests for a backend the node does not run, or for capabilities the backend lacks, return HTTP 400 before any resources are allocated. For `container`, `autoPause` defaults to false and may not be true.
+    #[serde(rename = "backend")]
+    #[validate(nested)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backend: Option<models::SandboxBackend>,
+
     /// Time to live for the sandbox in seconds.
     #[serde(rename = "timeout")]
     #[validate(range(min = 0u32))]
@@ -3656,6 +3696,7 @@ impl NewColdSandbox {
     pub fn new(image: String) -> NewColdSandbox {
         NewColdSandbox {
             image,
+            backend: None,
             timeout: Some(15),
             auto_pause: Some(true),
             auto_resume: None,
@@ -3683,6 +3724,7 @@ impl std::fmt::Display for NewColdSandbox {
         let params: Vec<Option<String>> = vec![
             Some("image".to_string()),
             Some(self.image.to_string()),
+            // Skipping backend in query parameter serialization
             self.timeout
                 .as_ref()
                 .map(|timeout| ["timeout".to_string(), timeout.to_string()].join(",")),
@@ -3747,6 +3789,7 @@ impl std::str::FromStr for NewColdSandbox {
         #[allow(dead_code)]
         struct IntermediateRep {
             pub image: Vec<String>,
+            pub backend: Vec<models::SandboxBackend>,
             pub timeout: Vec<u32>,
             pub auto_pause: Vec<bool>,
             pub auto_resume: Vec<models::SandboxAutoResumeConfig>,
@@ -3787,6 +3830,11 @@ impl std::str::FromStr for NewColdSandbox {
                     #[allow(clippy::redundant_clone)]
                     "image" => intermediate_rep.image.push(
                         <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "backend" => intermediate_rep.backend.push(
+                        <models::SandboxBackend as std::str::FromStr>::from_str(val)
+                            .map_err(|x| x.to_string())?,
                     ),
                     #[allow(clippy::redundant_clone)]
                     "timeout" => intermediate_rep.timeout.push(
@@ -3879,6 +3927,7 @@ impl std::str::FromStr for NewColdSandbox {
                 .into_iter()
                 .next()
                 .ok_or_else(|| "image missing in NewColdSandbox".to_string())?,
+            backend: intermediate_rep.backend.into_iter().next(),
             timeout: intermediate_rep.timeout.into_iter().next(),
             auto_pause: intermediate_rep.auto_pause.into_iter().next(),
             auto_resume: intermediate_rep.auto_resume.into_iter().next(),
@@ -6208,6 +6257,11 @@ pub struct Sandbox {
     #[validate(custom(function = "check_xss_string"))]
     pub client_id: String,
 
+    #[serde(rename = "backend")]
+    #[validate(nested)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backend: Option<models::SandboxBackend>,
+
     /// Version of the envd running in the sandbox
     #[serde(rename = "envdVersion")]
     #[validate(custom(function = "check_xss_string"))]
@@ -6247,6 +6301,7 @@ impl Sandbox {
             sandbox_id,
             alias: None,
             client_id,
+            backend: None,
             envd_version,
             envd_access_token: None,
             traffic_access_token: None,
@@ -6270,6 +6325,7 @@ impl std::fmt::Display for Sandbox {
                 .map(|alias| ["alias".to_string(), alias.to_string()].join(",")),
             Some("clientID".to_string()),
             Some(self.client_id.to_string()),
+            // Skipping backend in query parameter serialization
             Some("envdVersion".to_string()),
             Some(self.envd_version.to_string()),
             self.envd_access_token.as_ref().map(|envd_access_token| {
@@ -6320,6 +6376,7 @@ impl std::str::FromStr for Sandbox {
             pub sandbox_id: Vec<String>,
             pub alias: Vec<String>,
             pub client_id: Vec<String>,
+            pub backend: Vec<models::SandboxBackend>,
             pub envd_version: Vec<String>,
             pub envd_access_token: Vec<String>,
             pub traffic_access_token: Vec<String>,
@@ -6360,6 +6417,11 @@ impl std::str::FromStr for Sandbox {
                     #[allow(clippy::redundant_clone)]
                     "clientID" => intermediate_rep.client_id.push(
                         <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "backend" => intermediate_rep.backend.push(
+                        <models::SandboxBackend as std::str::FromStr>::from_str(val)
+                            .map_err(|x| x.to_string())?,
                     ),
                     #[allow(clippy::redundant_clone)]
                     "envdVersion" => intermediate_rep.envd_version.push(
@@ -6411,6 +6473,7 @@ impl std::str::FromStr for Sandbox {
                 .into_iter()
                 .next()
                 .ok_or_else(|| "clientID missing in Sandbox".to_string())?,
+            backend: intermediate_rep.backend.into_iter().next(),
             envd_version: intermediate_rep
                 .envd_version
                 .into_iter()
@@ -6639,6 +6702,50 @@ impl std::ops::DerefMut for SandboxAutoResumeEnabled {
     }
 }
 
+/// Runtime that executes the sandbox. `firecracker` runs a microVM; `container` runs an OCI container on the same rootfs and network, with fewer capabilities. A node accepts only the backends listed in its `enabled_backends`.
+/// Enumeration of values.
+/// Since this enum's variants do not hold data, we can easily define them as `#[repr(C)]`
+/// which helps with FFI.
+#[allow(non_camel_case_types, clippy::large_enum_variant)]
+#[repr(C)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+#[cfg_attr(feature = "conversion", derive(frunk_enum_derive::LabelledGenericEnum))]
+pub enum SandboxBackend {
+    #[serde(rename = "firecracker")]
+    Firecracker,
+    #[serde(rename = "container")]
+    Container,
+}
+
+impl validator::Validate for SandboxBackend {
+    fn validate(&self) -> std::result::Result<(), validator::ValidationErrors> {
+        std::result::Result::Ok(())
+    }
+}
+
+impl std::fmt::Display for SandboxBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            SandboxBackend::Firecracker => write!(f, "firecracker"),
+            SandboxBackend::Container => write!(f, "container"),
+        }
+    }
+}
+
+impl std::str::FromStr for SandboxBackend {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "firecracker" => std::result::Result::Ok(SandboxBackend::Firecracker),
+            "container" => std::result::Result::Ok(SandboxBackend::Container),
+            _ => std::result::Result::Err(format!(r#"Value not valid: {s}"#)),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
 #[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
 pub struct SandboxDetail {
@@ -6662,6 +6769,11 @@ pub struct SandboxDetail {
     #[serde(rename = "clientID")]
     #[validate(custom(function = "check_xss_string"))]
     pub client_id: String,
+
+    #[serde(rename = "backend")]
+    #[validate(nested)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backend: Option<models::SandboxBackend>,
 
     /// Time when the sandbox was started
     #[serde(rename = "startedAt")]
@@ -6755,6 +6867,7 @@ impl SandboxDetail {
             alias: None,
             sandbox_id,
             client_id,
+            backend: None,
             started_at,
             end_at,
             envd_version,
@@ -6788,6 +6901,8 @@ impl std::fmt::Display for SandboxDetail {
             Some(self.sandbox_id.to_string()),
             Some("clientID".to_string()),
             Some(self.client_id.to_string()),
+            // Skipping backend in query parameter serialization
+
             // Skipping startedAt in query parameter serialization
 
             // Skipping endAt in query parameter serialization
@@ -6856,6 +6971,7 @@ impl std::str::FromStr for SandboxDetail {
             pub alias: Vec<String>,
             pub sandbox_id: Vec<String>,
             pub client_id: Vec<String>,
+            pub backend: Vec<models::SandboxBackend>,
             pub started_at: Vec<chrono::DateTime<chrono::Utc>>,
             pub end_at: Vec<chrono::DateTime<chrono::Utc>>,
             pub envd_version: Vec<String>,
@@ -6906,6 +7022,11 @@ impl std::str::FromStr for SandboxDetail {
                     #[allow(clippy::redundant_clone)]
                     "clientID" => intermediate_rep.client_id.push(
                         <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "backend" => intermediate_rep.backend.push(
+                        <models::SandboxBackend as std::str::FromStr>::from_str(val)
+                            .map_err(|x| x.to_string())?,
                     ),
                     #[allow(clippy::redundant_clone)]
                     "startedAt" => intermediate_rep.started_at.push(
@@ -7002,6 +7123,7 @@ impl std::str::FromStr for SandboxDetail {
                 .into_iter()
                 .next()
                 .ok_or_else(|| "clientID missing in SandboxDetail".to_string())?,
+            backend: intermediate_rep.backend.into_iter().next(),
             started_at: intermediate_rep
                 .started_at
                 .into_iter()

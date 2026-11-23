@@ -137,7 +137,7 @@ impl ObservabilityService {
 mod tests {
     use super::*;
     use crate::orchestrator::{FileBackedSandboxPersister, InMemoryMetadataStore, Orchestrator};
-    use crate::sandbox::FirecrackerSandboxFactory;
+    use crate::sandbox::{BackendRegistry, FirecrackerSandboxFactory};
     use crate::virtualization::VirtualizationMode;
 
     // Issue ③ / R5 (#341 maintainer review): a real node's admin /nodes must
@@ -150,7 +150,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let orchestrator = Orchestrator::new(
             InMemoryMetadataStore::new(),
-            FirecrackerSandboxFactory::new(),
+            BackendRegistry::firecracker(FirecrackerSandboxFactory::new()),
             FileBackedSandboxPersister::new(tmp.path().to_path_buf(), VirtualizationMode::Kvm),
         )
         .await

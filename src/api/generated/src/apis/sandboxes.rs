@@ -216,6 +216,8 @@ pub enum SandboxesSandboxIdNetworkPutResponse {
 pub enum SandboxesSandboxIdPausePostResponse {
     /// The sandbox was paused successfully and can be resumed
     Status204_TheSandboxWasPausedSuccessfullyAndCanBeResumed,
+    /// Bad request
+    Status400_BadRequest(models::Error),
     /// Conflict
     Status409_Conflict(models::Error),
     /// Not found

@@ -13,6 +13,7 @@ pub use network::{NetworkConfig, NetworkEgressConfig, NetworkInternalConfig};
 use overlaybd::config::UpperMode;
 use serde::Deserialize;
 
+use crate::types::SandboxBackendKind;
 use crate::virtualization::VirtualizationMode;
 
 const ENV_CONFIG_PATH: &str = "AENV_CONFIG_PATH";
@@ -96,6 +97,12 @@ pub struct AppConfig {
     pub deps_path: PathBuf,
     #[config(default = "kvm", env = "AENV_VIRTUALIZATION_MODE")]
     pub virtualization_mode: VirtualizationMode,
+    /// Sandbox backends this node runs. A request selects one with
+    /// `backend`; requests that omit it use Firecracker.
+    #[config(default = ["firecracker"])]
+    pub enabled_backends: Vec<SandboxBackendKind>,
+    #[config(nested)]
+    pub container: ContainerConfig,
     #[config(nested)]
     pub firecracker: FirecrackerConfig,
     #[config(nested)]
@@ -141,6 +148,14 @@ pub struct AppConfig {
     pub network: NetworkConfig,
     #[config(nested)]
     pub custom_extension: CustomExtensionConfig,
+}
+
+/// Container backend settings, read only when `container` is enabled.
+#[derive(Debug, Deserialize, Clone, Config)]
+pub struct ContainerConfig {
+    /// OCI runtime executable: `runc`, `crun`, `runsc`, or an absolute path.
+    #[config(default = "runc")]
+    pub runtime: String,
 }
 
 #[derive(Debug, Deserialize, Clone, Config)]
@@ -1062,6 +1077,7 @@ impl AppConfig {
     }
 
     fn validate(&self) -> Result<()> {
+        self.validate_enabled_backends()?;
         self.validate_pool_config()?;
         self.image.cache.gc.validate()?;
         NetworkConfig::validate(&self.network)?;
@@ -1078,6 +1094,28 @@ impl AppConfig {
         self.validate_volume_limits()?;
         self.validate_template_builder()?;
         Ok(())
+    }
+
+    fn validate_enabled_backends(&self) -> Result<()> {
+        if self.enabled_backends.is_empty() {
+            bail!("enabled_backends must list at least one backend");
+        }
+        for (index, backend) in self.enabled_backends.iter().enumerate() {
+            if self.enabled_backends[..index].contains(backend) {
+                bail!("enabled_backends lists {backend} more than once");
+            }
+        }
+        if self.backend_enabled(SandboxBackendKind::Container)
+            && self.container.runtime.trim().is_empty()
+        {
+            bail!("container.runtime must not be empty when the container backend is enabled");
+        }
+        Ok(())
+    }
+
+    /// Whether this node runs sandboxes on `backend`.
+    pub fn backend_enabled(&self, backend: SandboxBackendKind) -> bool {
+        self.enabled_backends.contains(&backend)
     }
 
     fn validate_template_builder(&self) -> Result<()> {
@@ -1718,6 +1756,48 @@ mod tests {
             "config/default.toml and the #[config(default)] values in src/cfg.rs drifted; \
              update one to match the other, or INTENTIONAL if the difference is deliberate"
         );
+    }
+
+    #[test]
+    fn enabled_backends_default_to_firecracker_and_are_validated() -> Result<()> {
+        let temp = tempdir()?;
+        let path = temp.path().join("backends.toml");
+
+        std::fs::write(&path, "")?;
+        let config = ConfigManager::new_from_path(&path)?;
+        assert_eq!(
+            config.config().enabled_backends,
+            vec![SandboxBackendKind::Firecracker]
+        );
+        assert!(!config
+            .config()
+            .backend_enabled(SandboxBackendKind::Container));
+
+        std::fs::write(&path, "enabled_backends = [\"container\", \"firecracker\"]")?;
+        let config = ConfigManager::new_from_path(&path)?;
+        assert!(config
+            .config()
+            .backend_enabled(SandboxBackendKind::Container));
+        assert_eq!(config.config().container.runtime, "runc");
+
+        for (contents, message) in [
+            ("enabled_backends = []", "at least one backend"),
+            (
+                "enabled_backends = [\"firecracker\", \"firecracker\"]",
+                "more than once",
+            ),
+            (
+                "enabled_backends = [\"container\"]\n[container]\nruntime = \" \"",
+                "container.runtime",
+            ),
+        ] {
+            std::fs::write(&path, contents)?;
+            let err = ConfigManager::new_from_path(&path).unwrap_err();
+            assert!(format!("{err:#}").contains(message), "{contents}: {err:#}");
+        }
+        std::fs::write(&path, "enabled_backends = [\"docker\"]")?;
+        assert!(ConfigManager::new_from_path(&path).is_err());
+        Ok(())
     }
 
     #[test]

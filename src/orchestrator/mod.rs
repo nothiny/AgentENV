@@ -6,7 +6,7 @@ mod service;
 mod store;
 mod types;
 
-use crate::types::SandboxId;
+use crate::types::{BackendCapability, SandboxBackendKind, SandboxId};
 use crate::virtualization::VirtualizationMode;
 
 pub use metrics::OrchestratorMetrics;
@@ -60,6 +60,15 @@ pub enum OrchestratorError {
     #[error("orchestrator is shutting down")]
     ShuttingDown,
 
+    #[error("sandbox backend '{backend}' is not enabled on this node")]
+    BackendNotEnabled { backend: SandboxBackendKind },
+
+    #[error("{backend} sandboxes do not support {capability}")]
+    UnsupportedCapability {
+        backend: SandboxBackendKind,
+        capability: BackendCapability,
+    },
+
     #[error("sandbox {0} not found")]
     SandboxNotFound(SandboxId),
 
@@ -97,6 +106,18 @@ pub enum OrchestratorError {
 
     #[error("internal error: {0}")]
     InternalError(String),
+}
+
+impl OrchestratorError {
+    /// Whether the request named a backend this node does not run, or asked
+    /// the sandbox's backend for a capability it lacks. The API reports these
+    /// as client errors.
+    pub fn is_backend_rejection(&self) -> bool {
+        matches!(
+            self,
+            Self::BackendNotEnabled { .. } | Self::UnsupportedCapability { .. }
+        )
+    }
 }
 
 impl From<store::StoreError> for OrchestratorError {

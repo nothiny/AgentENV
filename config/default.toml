@@ -23,6 +23,15 @@ home_path = "/var/lib/aenv"
 # AENV_VIRTUALIZATION_MODE overrides this value.
 virtualization_mode = "kvm"
 
+# Sandbox backends this node runs: "firecracker" and/or "container". Requests
+# select one with `backend`; requests that omit it use Firecracker.
+enabled_backends = ["firecracker"]
+
+[container]
+# OCI runtime used by the container backend: "runc", "crun", "runsc", or an
+# absolute path. Read only when "container" is in enabled_backends.
+runtime = "runc"
+
 [firecracker]
 # Use an existing Firecracker executable instead of downloading one. It must
 # be a readable, non-empty, executable regular file.
