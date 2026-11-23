@@ -70,6 +70,13 @@ const CAPABILITIES: &[&str] = &[
 
 const CPU_PERIOD_US: u64 = 100_000;
 
+/// A drive mounted on the host and bound into the container.
+pub(super) struct DriveBind {
+    pub source: std::path::PathBuf,
+    pub destination: std::path::PathBuf,
+    pub read_only: bool,
+}
+
 pub(super) struct BundleSpec<'a> {
     pub work_dir: &'a Path,
     pub hostname: &'a str,
@@ -79,6 +86,7 @@ pub(super) struct BundleSpec<'a> {
     pub pids_limit: u32,
     pub envd_port: u16,
     pub cgroups_path: &'a str,
+    pub drives: &'a [DriveBind],
 }
 
 /// Writes `init.sh`, the /etc files and `config.json` into the work directory.
@@ -117,9 +125,20 @@ fn bind(destination: &str, source: &Path, read_only: bool) -> Value {
 
 pub(super) fn oci_config(spec: &BundleSpec<'_>) -> Value {
     let dir = spec.work_dir;
+    let drive_mounts: Vec<Value> = spec
+        .drives
+        .iter()
+        .map(|drive| {
+            bind(
+                drive.destination.to_str().unwrap_or_default(),
+                &drive.source,
+                drive.read_only,
+            )
+        })
+        .collect();
     let memory_bytes = u64::from(spec.resources.memory_mib) * 1024 * 1024;
     let cpu_quota = u64::from(spec.resources.cpu_count.max(1)) * CPU_PERIOD_US;
-    json!({
+    let mut config = json!({
         "ociVersion": "1.0.2",
         "process": {
             "terminal": false,
@@ -184,7 +203,12 @@ pub(super) fn oci_config(spec: &BundleSpec<'_>) -> Value {
                 "/proc/bus", "/proc/fs", "/proc/irq", "/proc/sys", "/proc/sysrq-trigger"
             ]
         }
-    })
+    });
+    config["mounts"]
+        .as_array_mut()
+        .expect("mounts is an array")
+        .extend(drive_mounts);
+    config
 }
 
 #[cfg(test)]
@@ -207,7 +231,27 @@ mod tests {
             pids_limit: 4096,
             envd_port: 49983,
             cgroups_path: "/aenv-container/aenv-x",
+            drives: DRIVES,
         }
+    }
+
+    static DRIVES: &[DriveBind] = &[];
+
+    #[test]
+    fn drives_are_bound_after_the_base_mounts() {
+        let drives = [DriveBind {
+            source: "/work/sb/drives/data/sub".into(),
+            destination: "/data".into(),
+            read_only: true,
+        }];
+        let mut spec = spec(Path::new("/work/sb"));
+        spec.drives = &drives;
+        let config = oci_config(&spec);
+        let mounts = config["mounts"].as_array().unwrap();
+        let last = mounts.last().unwrap();
+        assert_eq!(last["destination"], "/data");
+        assert_eq!(last["source"], "/work/sb/drives/data/sub");
+        assert!(last["options"].as_array().unwrap().contains(&json!("ro")));
     }
 
     #[test]
@@ -239,7 +283,10 @@ mod tests {
             .unwrap();
         assert!(!caps.contains(&json!("CAP_NET_RAW")));
         assert!(!caps.contains(&json!("CAP_SYS_ADMIN")));
-        assert_eq!(config["process"]["args"], json!(["/agentenv/bin/busybox", "init"]));
+        assert_eq!(
+            config["process"]["args"],
+            json!(["/agentenv/bin/busybox", "init"])
+        );
     }
 
     #[test]

@@ -1716,6 +1716,16 @@ impl Sandboxes<()> for ApiImpl {
             }
         };
 
+        // Reject before the volume snapshot below, which has side effects.
+        if !source_metadata.backend.supports(BackendCapability::Fork) {
+            return Ok(SandboxesSandboxIdForkPostResponse::Status400_BadRequest(
+                OrchestratorError::UnsupportedCapability {
+                    backend: source_metadata.backend,
+                    capability: BackendCapability::Fork,
+                }
+                .into(),
+            ));
+        }
         let count = body.as_ref().and_then(|b| b.count).unwrap_or(1);
         if !(1..=100).contains(&count) {
             return Ok(SandboxesSandboxIdForkPostResponse::Status400_BadRequest(
@@ -2974,15 +2984,6 @@ mod cold_start_backend_tests {
                 Box::new(|b| b.extra_boot_args = Some("x=1".to_string())),
             ),
             (
-                "volumeMounts",
-                Box::new(|b| {
-                    b.volume_mounts = Some(vec![models::SandboxVolumeMount::new(
-                        "v".to_string(),
-                        "/data".to_string(),
-                    )])
-                }),
-            ),
-            (
                 "customExtensionParams",
                 Box::new(|b| {
                     b.custom_extension_params = Some(HashMap::from([(
@@ -3006,7 +3007,14 @@ mod cold_start_backend_tests {
         let mut request = body(Some(models::SandboxBackend::Container));
         request.auto_pause = Some(false);
         request.extra_boot_args = Some("  ".to_string());
-        request.volume_mounts = Some(Vec::new());
+        assert!(cold_start_backend(&request, BOTH).is_ok());
+
+        // Volumes and attached drives are supported.
+        let mut request = body(Some(models::SandboxBackend::Container));
+        request.volume_mounts = Some(vec![models::SandboxVolumeMount::new(
+            "v".to_string(),
+            "/data".to_string(),
+        )]);
         assert!(cold_start_backend(&request, BOTH).is_ok());
 
         // Egress rules are supported.

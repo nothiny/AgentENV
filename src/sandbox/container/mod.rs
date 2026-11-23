@@ -9,10 +9,15 @@
 //! Requires the server to run as root: rootful OCI runtimes need the full
 //! capability set, which the non-root systemd unit does not grant.
 //!
-//! Supported: cold start, exec, files, proxy, delete, egress rules and
-//! network policy updates. Pause, snapshot, fork, volumes and attached drives
-//! are rejected before they reach this backend (see
+//! Supported: cold start, exec, files, proxy, delete, egress rules, network
+//! policy updates, managed volumes and attached drives. Pause, snapshot and
+//! fork are rejected before they reach this backend (see
 //! `SandboxBackendKind::supports`).
+//!
+//! Drives (volumes and attached drives) are OverlayBD devices mounted on the
+//! host under the work directory and bound into the container. Volume
+//! snapshots freeze the host mount, seal the writable upper as Firecracker
+//! does, and thaw it.
 
 mod bundle;
 mod guest;
@@ -33,7 +38,7 @@ use tokio::sync::watch;
 use tracing::{debug, info, warn};
 use uvm_ublk_daemon::CreateOverlaybdRuntimeDeviceRequest;
 
-use self::bundle::BundleSpec;
+use self::bundle::{BundleSpec, DriveBind};
 use self::netns::GuestLink;
 use self::runtime::OciRuntime;
 use super::backend::{
@@ -42,16 +47,18 @@ use super::backend::{
     SandboxRuntimeInfo,
 };
 use super::envd::EnvdInstance;
+use super::extra_drive::{prepare_extra_drives, ExtraDrivePrepareMode};
+use super::firecracker::restack_snapshot_overlaybd_device;
 use super::network::{NetworkManager, SlotLease};
 use super::process::Executor;
-use super::ublk::{SharedReadOnlyDevice, UblkCreateSpec, UblkDevice};
+use super::ublk::{OverlaybdRuntimeHandle, SharedReadOnlyDevice, UblkCreateSpec, UblkDevice};
 use super::{
     resolve_tools_image, CustomExtensionParams, EnvdAccessToken, EnvdApi, FreshSandboxBuildSpec,
     SandboxExecutor, SandboxLaunchConfig, SandboxNetworkPolicy, UblkDeviceManager,
 };
 use crate::cfg::{AppConfig, ConfigManager};
 use crate::snapshot::{RunnableSnapshot, SandboxSnapshotManifest};
-use crate::types::{RuntimeArtifactSet, SandboxId, SandboxResources};
+use crate::types::{ExtraDrive, RuntimeArtifactSet, SandboxId, SandboxResources};
 
 /// Container names and cgroups carry this prefix, so startup reconciliation
 /// only touches containers this server created.
@@ -134,6 +141,14 @@ fn finish(failures: Vec<String>) -> Result<()> {
 /// Unmounts everything under a sandbox work directory and removes it.
 fn remove_work_dir(dir: &Path) -> Result<()> {
     netns::remove_netns(&dir.join("netns"))?;
+    if let Ok(drives) = std::fs::read_dir(dir.join("drives")) {
+        for drive in drives.flatten() {
+            if is_mount_point(&drive.path())? {
+                thaw(&drive.path());
+            }
+            unmount(&drive.path())?;
+        }
+    }
     for mount_point in ["tools", "rootfs"] {
         unmount(&dir.join(mount_point))?;
     }
@@ -191,8 +206,66 @@ fn mount_ext4(device: &Path, target: &Path, read_only: bool) -> Result<()> {
     if read_only {
         flags |= MsFlags::MS_RDONLY;
     }
-    mount(Some(device), target, Some("ext4"), flags, None::<&str>)
+    // A read-only mount must not replay the journal: that would write to a
+    // device other sandboxes may share.
+    let data = read_only.then_some("noload");
+    mount(Some(device), target, Some("ext4"), flags, data)
         .with_context(|| format!("mount {} on {}", device.display(), target.display()))
+}
+
+const FIFREEZE: libc::c_ulong = 0xC004_5877;
+const FITHAW: libc::c_ulong = 0xC004_5878;
+
+/// FIFREEZE/FITHAW on the filesystem mounted at `mount_point`.
+fn freeze_ioctl(mount_point: &Path, request: libc::c_ulong) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let dir = std::fs::File::open(mount_point)?;
+    let mut arg: libc::c_int = 0;
+    // SAFETY: FIFREEZE/FITHAW take an int argument the kernel ignores, and
+    // `dir` keeps the descriptor open for the call.
+    let rc = unsafe { libc::ioctl(dir.as_raw_fd(), request as _, &mut arg) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+fn freeze(mount_point: &Path) -> Result<()> {
+    freeze_ioctl(mount_point, FIFREEZE).with_context(|| format!("freeze {}", mount_point.display()))
+}
+
+/// Thaws `mount_point`; not frozen (EINVAL) is success.
+fn thaw(mount_point: &Path) -> bool {
+    match freeze_ioctl(mount_point, FITHAW) {
+        Ok(()) => true,
+        Err(err) if err.raw_os_error() == Some(libc::EINVAL) => true,
+        Err(err) => {
+            warn!(mount = %mount_point.display(), error = %err, "thaw failed");
+            false
+        }
+    }
+}
+
+fn sync_filesystem(mount_point: &Path) -> Result<()> {
+    let dir = std::fs::File::open(mount_point)
+        .with_context(|| format!("open {}", mount_point.display()))?;
+    nix::unistd::syncfs(&dir).with_context(|| format!("syncfs {}", mount_point.display()))
+}
+
+/// A drive attached to a container sandbox.
+struct AttachedDrive {
+    drive: ExtraDrive,
+    runtime: OverlaybdRuntimeHandle,
+    /// Host mount point under `drives/`, once mounted.
+    host_mount: Option<PathBuf>,
+}
+
+impl AttachedDrive {
+    /// Persistent volumes the sandbox can write, which volume snapshots seal.
+    fn is_writable_volume(&self) -> bool {
+        !self.drive.read_only() && self.drive.snapshot_output_dir().is_some()
+    }
 }
 
 impl SandboxBackendFactory for ContainerSandboxFactory {
@@ -257,6 +330,9 @@ pub struct ContainerSandbox {
     rootfs_image_config: Option<PathBuf>,
     rootfs_virtual_size: Option<u64>,
     mounts: Vec<PathBuf>,
+    drives: Vec<AttachedDrive>,
+    /// Volume mounts frozen by `freeze_and_snapshot_volumes`.
+    frozen: Vec<PathBuf>,
     slot: Option<SlotLease>,
     guest_netns: Option<PathBuf>,
     exited: Option<watch::Receiver<ExitState>>,
@@ -287,6 +363,8 @@ impl ContainerSandbox {
             rootfs_image_config: None,
             rootfs_virtual_size: None,
             mounts: Vec::new(),
+            drives: Vec::new(),
+            frozen: Vec::new(),
             slot: None,
             guest_netns: None,
             exited: None,
@@ -355,6 +433,112 @@ impl ContainerSandbox {
         let tools_dir = self.work_dir.join("tools");
         mount_ext4(&tools_device, &tools_dir, true)?;
         self.mounts.push(tools_dir);
+        self.attach_drives(config, &global_config).await
+    }
+
+    /// Creates a device per volume or attached drive and mounts it on the
+    /// host; the bundle binds each mount into the container.
+    async fn attach_drives(&mut self, config: &AppConfig, global_config: &Path) -> Result<()> {
+        let drives = self.build_spec.extra_drives.clone();
+        if drives.is_empty() {
+            return Ok(());
+        }
+        let allow_shrink = config.ublk.overlaybd.allow_shrink;
+        let (attachments, runtimes) = prepare_extra_drives(
+            &drives,
+            global_config,
+            &self.work_dir,
+            config.ublk.overlaybd.runtime_upper_mode,
+            |_| ExtraDrivePrepareMode::Fresh { allow_shrink },
+        )
+        .await
+        .context("prepare drives")?
+        .into_parts();
+        for ((drive, attachment), runtime) in drives.into_iter().zip(attachments).zip(runtimes) {
+            let device = self.work_dir.join(&attachment.attachment_path);
+            let host_mount = self.work_dir.join("drives").join(drive.drive_id());
+            let read_only = drive.read_only();
+            // Recorded before mounting so `stop` releases the device either way.
+            self.drives.push(AttachedDrive {
+                drive,
+                runtime,
+                host_mount: None,
+            });
+            mount_ext4(&device, &host_mount, read_only)?;
+            self.drives.last_mut().expect("just pushed").host_mount = Some(host_mount);
+        }
+        Ok(())
+    }
+
+    fn drive_binds(&self) -> Vec<DriveBind> {
+        self.drives
+            .iter()
+            .filter_map(|attached| {
+                let host_mount = attached.host_mount.as_ref()?;
+                let source = match attached.drive.sub_path() {
+                    Some(sub_path) => host_mount.join(sub_path),
+                    None => host_mount.clone(),
+                };
+                Some(DriveBind {
+                    source,
+                    destination: attached.drive.mount_path().to_path_buf(),
+                    read_only: attached.drive.read_only(),
+                })
+            })
+            .collect()
+    }
+
+    /// Seals the writable volumes, whose filesystems the caller has frozen.
+    async fn seal_volumes(&self) -> Result<()> {
+        for attached in self
+            .drives
+            .iter()
+            .filter(|attached| attached.is_writable_volume())
+        {
+            let output_dir = attached
+                .drive
+                .snapshot_output_dir()
+                .expect("writable volumes have an output directory");
+            let layer = format!("snapshot-{}.commit", uuid::Uuid::now_v7().simple());
+            restack_snapshot_overlaybd_device(
+                &attached.runtime.device,
+                false,
+                &attached.runtime.image_config_path,
+                output_dir,
+                &layer,
+                "volume",
+            )
+            .await
+            .with_context(|| format!("snapshot volume '{}'", attached.drive.drive_id()))?;
+        }
+        Ok(())
+    }
+
+    fn writable_volume_mounts(&self) -> Vec<PathBuf> {
+        self.drives
+            .iter()
+            .filter(|attached| attached.is_writable_volume())
+            .filter_map(|attached| attached.host_mount.clone())
+            .collect()
+    }
+
+    /// Freezes the writable volumes and records them as frozen.
+    fn freeze_volumes(&mut self) -> Result<()> {
+        for mount in self.writable_volume_mounts() {
+            sync_filesystem(&mount)?;
+            freeze(&mount)?;
+            self.frozen.push(mount);
+        }
+        Ok(())
+    }
+
+    fn thaw_frozen(&mut self) -> Result<()> {
+        while let Some(mount) = self.frozen.last() {
+            if !thaw(mount) {
+                bail!("thaw volume {}", mount.display());
+            }
+            self.frozen.pop();
+        }
         Ok(())
     }
 
@@ -422,6 +606,7 @@ impl ContainerSandbox {
             pids_limit: DEFAULT_PIDS_LIMIT,
             envd_port: config.tools.control_plane_port,
             cgroups_path: &cgroups_path,
+            drives: &self.drive_binds(),
         })?;
         self.start_runtime()?;
 
@@ -519,6 +704,27 @@ impl ContainerSandbox {
                 Err(err) => failures.push(format!("join slot teardown: {err}")),
             }
         }
+        if let Err(err) = self.thaw_frozen() {
+            failures.push(format!("{err:#}"));
+        }
+        while let Some(attached) = self.drives.pop() {
+            if let Some(host_mount) = &attached.host_mount {
+                if let Err(err) = unmount(host_mount) {
+                    failures.push(format!("{err:#}"));
+                    // Keep the device: it is still mounted.
+                    continue;
+                }
+            }
+            if let Err(err) = UblkDeviceManager::global()
+                .release_device(&attached.runtime.device)
+                .await
+            {
+                failures.push(format!(
+                    "release drive '{}': {err:#}",
+                    attached.drive.drive_id()
+                ));
+            }
+        }
         while let Some(path) = self.mounts.pop() {
             if let Err(err) = unmount(&path) {
                 failures.push(format!("{err:#}"));
@@ -606,8 +812,21 @@ impl SandboxBackend for ContainerSandbox {
     }
 
     async fn snapshot_volumes(&mut self) -> SandboxCaptureResult<()> {
-        // Container sandboxes have no managed volumes.
-        Ok(())
+        if self.writable_volume_mounts().is_empty() {
+            return Ok(());
+        }
+        let result = match self.freeze_volumes() {
+            Ok(()) => self.seal_volumes().await,
+            Err(err) => Err(err),
+        };
+        match (result, self.thaw_frozen()) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(err), Ok(())) => Err(SandboxCaptureError::recoverable(err)),
+            (Ok(()), Err(thaw_err)) => Err(SandboxCaptureError::terminal(thaw_err)),
+            (Err(err), Err(thaw_err)) => Err(SandboxCaptureError::terminal(anyhow!(
+                "volume snapshot failed: {err:#}; {thaw_err:#}"
+            ))),
+        }
     }
 
     async fn fork(
@@ -633,12 +852,24 @@ impl SandboxBackend for ContainerSandbox {
     }
 
     async fn freeze_and_snapshot_volumes(&mut self) -> SandboxCaptureResult<()> {
-        // Container sandboxes have no managed volumes.
+        let result = match self.freeze_volumes() {
+            Ok(()) => self.seal_volumes().await,
+            Err(err) => Err(err),
+        };
+        if let Err(err) = result {
+            // Recoverable errors must leave writes resumed.
+            return Err(match self.thaw_frozen() {
+                Ok(()) => SandboxCaptureError::recoverable(err),
+                Err(thaw_err) => SandboxCaptureError::terminal(anyhow!(
+                    "volume capture failed: {err:#}; {thaw_err:#}"
+                )),
+            });
+        }
         Ok(())
     }
 
     async fn thaw_volumes(&mut self) -> Result<()> {
-        Ok(())
+        self.thaw_frozen()
     }
 
     fn host_interaction_ip(&self) -> Option<std::net::Ipv4Addr> {
@@ -654,6 +885,11 @@ impl SandboxBackend for ContainerSandbox {
         ]
         .into_iter()
         .flatten()
+        .chain(
+            self.drives
+                .iter()
+                .map(|attached| attached.runtime.image_config_path.clone()),
+        )
         .collect();
         SandboxRuntimeInfo {
             rootfs_virtual_size: self.rootfs_virtual_size,
@@ -662,10 +898,14 @@ impl SandboxBackend for ContainerSandbox {
     }
 
     fn startup_artifacts(&self) -> RuntimeArtifactSet {
-        RuntimeArtifactSet::from_overlaybd_image_configs(vec![self
-            .build_spec
-            .image_config_path
-            .clone()])
+        let mut paths = vec![self.build_spec.image_config_path.clone()];
+        paths.extend(
+            self.build_spec
+                .extra_drives
+                .iter()
+                .map(|drive| drive.image_config_path().to_path_buf()),
+        );
+        RuntimeArtifactSet::from_overlaybd_image_configs(paths)
     }
 
     async fn update_network_policy(&mut self, policy: Option<SandboxNetworkPolicy>) -> Result<()> {

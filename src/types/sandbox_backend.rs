@@ -58,14 +58,16 @@ impl SandboxBackendKind {
             Self::Firecracker => true,
             Self::Container => match capability {
                 // The slot's egress rules match the container's veth, which
-                // keeps the name tap0.
-                BackendCapability::EgressRules | BackendCapability::UpdateNetwork => true,
+                // keeps the name tap0; drives are mounted on the host and
+                // bound into the container.
+                BackendCapability::EgressRules
+                | BackendCapability::UpdateNetwork
+                | BackendCapability::ManagedVolumes
+                | BackendCapability::AttachedDrives => true,
                 BackendCapability::Pause
                 | BackendCapability::Snapshot
                 | BackendCapability::SnapshotRestore
                 | BackendCapability::Fork
-                | BackendCapability::ManagedVolumes
-                | BackendCapability::AttachedDrives
                 | BackendCapability::ExtraBootArgs
                 | BackendCapability::CustomExtension => false,
             },
@@ -162,6 +164,9 @@ mod tests {
         for capability in all {
             assert!(SandboxBackendKind::Firecracker.supports(capability));
         }
-        assert_eq!(container, vec![EgressRules, UpdateNetwork]);
+        assert_eq!(
+            container,
+            vec![ManagedVolumes, AttachedDrives, EgressRules, UpdateNetwork]
+        );
     }
 }

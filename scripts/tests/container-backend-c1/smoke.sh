@@ -100,7 +100,7 @@ stop_server
 # --- 2. Node with both backends --------------------------------------------
 start_server '["firecracker", "container"]'
 
-for case in '"autoPause":true' '"autoResume":{"enabled":true}' '"extraBootArgs":"x=1"' '"volumeMounts":[{"name":"v","path":"/data"}]'; do
+for case in '"autoPause":true' '"autoResume":{"enabled":true}' '"extraBootArgs":"x=1"' '"customExtensionParams":{"k":"v"}'; do
     call POST /sandboxes-cold "{\"image\":\"$IMAGE\",\"backend\":\"container\",$case}"
     expect 400 unsupported_capability "container rejects {$case}"
 done

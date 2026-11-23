@@ -600,7 +600,7 @@ pub(super) async fn build_mem_snapshot_image_config(
 /// becomes the newest lower. Read-only runtimes skip the restack phase and
 /// only stage the persisted snapshot image config. The sealed layer always
 /// stays raw; compression, when enabled, happens once at publish time.
-pub(super) async fn restack_snapshot_overlaybd_device(
+pub(crate) async fn restack_snapshot_overlaybd_device(
     ublk_device: &UblkDevice,
     read_only: bool,
     live_runtime_image_config_path: &Path,
