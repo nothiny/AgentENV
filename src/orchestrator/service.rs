@@ -2000,6 +2000,49 @@ where
         })
     }
 
+    /// Seals a running sandbox's root filesystem into an OverlayBD image
+    /// config for publication, leaving the sandbox running. Returns the
+    /// sandbox's metadata and the config path.
+    pub async fn capture_rootfs(
+        self: &Arc<Self>,
+        sandbox_id: SandboxId,
+    ) -> Result<(SandboxMetadata, std::path::PathBuf)> {
+        self.require_capability(sandbox_id, BackendCapability::RootfsImage)
+            .await?;
+        let this = Arc::clone(self);
+        self.run_cancellation_safe("capture_rootfs", sandbox_id, async move {
+            this.capture_rootfs_inner(sandbox_id).await
+        })
+        .await
+    }
+
+    async fn capture_rootfs_inner(
+        self: Arc<Self>,
+        sandbox_id: SandboxId,
+    ) -> Result<(SandboxMetadata, std::path::PathBuf)> {
+        info!("capturing sandbox root filesystem");
+        let handle = self.begin_snapshot_operation(sandbox_id).await?;
+        let result = {
+            let mut sandbox = handle.lock().await;
+            sandbox.capture_rootfs().await
+        };
+        let image_config = match result {
+            Ok(image_config) => image_config,
+            Err(error) => {
+                return self
+                    .fail_snapshot_operation(sandbox_id, &handle, error, SandboxOperation::Snapshot)
+                    .await;
+            }
+        };
+        self.finish_snapshot_operation(sandbox_id).await?;
+        let metadata = self
+            .store
+            .get(&sandbox_id)
+            .await?
+            .ok_or(OrchestratorError::SandboxNotFound(sandbox_id))?;
+        Ok((metadata, image_config))
+    }
+
     pub async fn replace_sandbox_network_policy(
         self: &Arc<Self>,
         sandbox_id: SandboxId,

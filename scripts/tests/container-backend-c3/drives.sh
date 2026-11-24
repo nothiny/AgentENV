@@ -70,14 +70,16 @@ echo "      $(tail -1 <<<"$OUT")"
 create container "$MOUNT"
 check "an exclusive volume cannot be mounted twice (HTTP $STATUS)" test "$STATUS" = 409
 
-# Fork is unsupported and must be rejected before it seals the volumes.
-VOLUME_DIR=$AENV_HOME_PATH/volumes
-LAYERS_BEFORE=$(find "$VOLUME_DIR" -name 'snapshot-*.commit' 2>/dev/null | wc -l)
+# Forking copies the volume: the child gets its own copy-on-write volume
+# with the parent's data, sealed through the container's volume snapshot.
 call POST "/sandboxes/$A/fork" '{"count":1}'
-check "fork is rejected with 400 unsupported_capability" \
-    test "$STATUS/$(jq -r .reason <<<"$BODY_OUT")" = "400/unsupported_capability"
-check "the rejected fork sealed nothing" \
-    test "$(find "$VOLUME_DIR" -name 'snapshot-*.commit' 2>/dev/null | wc -l)" = "$LAYERS_BEFORE"
+check "fork a container with a volume" test "$STATUS" = 201
+K=$(jq -r '.[0].sandbox.sandboxID // empty' <<<"$BODY_OUT")
+check "the child sees the parent's volume data" test "$(in_box "$K" 'cat /data/hello')" = written-by-container
+in_box "$K" 'echo child > /data/hello' >/dev/null
+check "the child's volume writes stay out of the parent" \
+    test "$(in_box "$A" 'cat /data/hello')" = written-by-container
+call DELETE "/sandboxes/$K"; check "delete the fork child" test "$STATUS" = 204
 
 call DELETE "/sandboxes/$A"
 check "delete seals the volume" test "$STATUS" = 204

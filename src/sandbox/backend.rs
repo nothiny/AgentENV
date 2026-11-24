@@ -277,6 +277,16 @@ pub trait SandboxBackend: Send + 'static {
         at: &Path,
     ) -> SandboxCaptureResult<(SandboxSnapshotManifest, Option<Box<dyn Any + Send>>)>;
 
+    /// Seal the root filesystem into a standalone OverlayBD image config and
+    /// return its path, leaving the sandbox running. The config stays valid
+    /// while the sandbox runs. Backends that cannot do this return a
+    /// recoverable error.
+    async fn capture_rootfs(&mut self) -> SandboxCaptureResult<PathBuf> {
+        Err(SandboxCaptureError::recoverable(anyhow::anyhow!(
+            "this backend cannot capture its root filesystem"
+        )))
+    }
+
     /// Stop the sandbox and release all associated system resources.
     ///
     /// Idempotent: calling `stop` more than once must not return an error.

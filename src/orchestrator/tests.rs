@@ -6410,11 +6410,7 @@ async fn sandbox_logs_filters_inherited_history_and_does_not_hold_runtime_lock()
 /// that fails the test if any VM-state operation reaches the backend.
 async fn running_container_sandbox() -> Result<(Arc<TestOrchestrator>, SandboxMetadata)> {
     let behavior = Arc::new(MockBehavior::new());
-    for operation in [
-        MockOperation::Pause,
-        MockOperation::Snapshot,
-        MockOperation::Fork,
-    ] {
+    for operation in [MockOperation::Pause, MockOperation::Snapshot] {
         behavior.set_on_operation(
             operation,
             Arc::new(move || panic!("{operation:?} reached a container sandbox")),
@@ -6470,13 +6466,6 @@ async fn container_sandboxes_reject_unsupported_operations_without_side_effects(
     );
     assert_unsupported(
         orchestrator
-            .fork_sandbox(id, 1, NewTimeout::UseExisting)
-            .await
-            .unwrap_err(),
-        BackendCapability::Fork,
-    );
-    assert_unsupported(
-        orchestrator
             .patch_sandbox_custom_extension_params(id, serde_json::Map::new())
             .await
             .unwrap_err(),
@@ -6492,6 +6481,48 @@ async fn container_sandboxes_reject_unsupported_operations_without_side_effects(
     assert_eq!(current.state, SandboxState::Running);
     assert_proxy_ready(&orchestrator, &id).await?;
     Ok(())
+}
+
+#[tokio::test]
+async fn rootfs_capture_needs_the_capability_and_recovers_from_backend_errors() -> Result<()> {
+    setup();
+    let (orchestrator, container) = running_container_sandbox().await?;
+    // The mock keeps the trait's default, which refuses with a recoverable
+    // error: the sandbox must come back to Running.
+    let err = orchestrator.capture_rootfs(container.id).await.unwrap_err();
+    assert!(
+        matches!(err, OrchestratorError::SandboxOperationFailed { .. }),
+        "{err:?}"
+    );
+    let current = orchestrator.get_sandbox(&container.id).await?.unwrap();
+    assert_eq!(current.state, SandboxState::Running);
+
+    let firecracker = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?;
+    assert_unsupported_on(
+        orchestrator
+            .capture_rootfs(firecracker.id)
+            .await
+            .unwrap_err(),
+        SandboxBackendKind::Firecracker,
+        BackendCapability::RootfsImage,
+    );
+    Ok(())
+}
+
+fn assert_unsupported_on(
+    err: OrchestratorError,
+    expected_backend: SandboxBackendKind,
+    expected: BackendCapability,
+) {
+    match err {
+        OrchestratorError::UnsupportedCapability {
+            backend,
+            capability,
+        } if backend == expected_backend && capability == expected => {}
+        other => panic!("expected {expected_backend} to lack {expected:?}, got {other:?}"),
+    }
 }
 
 #[tokio::test]

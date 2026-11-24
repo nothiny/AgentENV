@@ -22,11 +22,15 @@ pub enum SandboxBackendKind {
 pub enum BackendCapability {
     /// Durable pause/resume, including `autoPause` and `autoResume`.
     Pause,
-    /// Capture a snapshot of a running sandbox.
+    /// Capture a snapshot of a running sandbox, including its memory.
     Snapshot,
+    /// Publish a running sandbox's root filesystem as an image that cold
+    /// starts on any backend.
+    RootfsImage,
     /// Launch a sandbox from a committed snapshot or template.
     SnapshotRestore,
-    /// Fork a running sandbox.
+    /// Fork a running sandbox. Container forks copy the filesystem only:
+    /// children start fresh processes.
     Fork,
     /// Managed `volumeMounts`.
     ManagedVolumes,
@@ -55,7 +59,8 @@ impl SandboxBackendKind {
     /// What this backend implements today. Grows as container phases land.
     pub fn supports(self, capability: BackendCapability) -> bool {
         match self {
-            Self::Firecracker => true,
+            // Firecracker publishes its rootfs through snapshot image export.
+            Self::Firecracker => capability != BackendCapability::RootfsImage,
             Self::Container => match capability {
                 // The slot's egress rules match the container's veth, which
                 // keeps the name tap0; drives are mounted on the host and
@@ -63,11 +68,12 @@ impl SandboxBackendKind {
                 BackendCapability::EgressRules
                 | BackendCapability::UpdateNetwork
                 | BackendCapability::ManagedVolumes
-                | BackendCapability::AttachedDrives => true,
+                | BackendCapability::AttachedDrives
+                | BackendCapability::RootfsImage
+                | BackendCapability::Fork => true,
                 BackendCapability::Pause
                 | BackendCapability::Snapshot
                 | BackendCapability::SnapshotRestore
-                | BackendCapability::Fork
                 | BackendCapability::ExtraBootArgs
                 | BackendCapability::CustomExtension => false,
             },
@@ -100,6 +106,7 @@ impl fmt::Display for BackendCapability {
         f.write_str(match self {
             Self::Pause => "pause/resume (autoPause, autoResume)",
             Self::Snapshot => "snapshot capture",
+            Self::RootfsImage => "root filesystem images",
             Self::SnapshotRestore => "launch from a snapshot or template",
             Self::Fork => "fork",
             Self::ManagedVolumes => "volumeMounts",
@@ -143,11 +150,12 @@ mod tests {
     }
 
     #[test]
-    fn firecracker_supports_everything_and_container_a_subset() {
+    fn firecracker_and_container_capabilities() {
         use BackendCapability::*;
         let all = [
             Pause,
             Snapshot,
+            RootfsImage,
             SnapshotRestore,
             Fork,
             ManagedVolumes,
@@ -161,12 +169,21 @@ mod tests {
             .into_iter()
             .filter(|capability| SandboxBackendKind::Container.supports(*capability))
             .collect();
-        for capability in all {
-            assert!(SandboxBackendKind::Firecracker.supports(capability));
-        }
+        let firecracker: Vec<_> = all
+            .into_iter()
+            .filter(|capability| !SandboxBackendKind::Firecracker.supports(*capability))
+            .collect();
+        assert_eq!(firecracker, vec![RootfsImage]);
         assert_eq!(
             container,
-            vec![ManagedVolumes, AttachedDrives, EgressRules, UpdateNetwork]
+            vec![
+                RootfsImage,
+                Fork,
+                ManagedVolumes,
+                AttachedDrives,
+                EgressRules,
+                UpdateNetwork
+            ]
         );
     }
 }

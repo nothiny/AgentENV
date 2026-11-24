@@ -10,9 +10,15 @@
 //! capability set, which the non-root systemd unit does not grant.
 //!
 //! Supported: cold start, exec, files, proxy, delete, egress rules, network
-//! policy updates, managed volumes and attached drives. Pause, snapshot and
-//! fork are rejected before they reach this backend (see
+//! policy updates, managed volumes, attached drives, root filesystem capture
+//! for publishing as an image, and filesystem-only forks. Pause and
+//! memory snapshots are rejected before they reach this backend (see
 //! `SandboxBackendKind::supports`).
+//!
+//! Capture and fork both seal the rootfs: freeze its host mount, turn the
+//! writable upper into a read-only layer the live device restacks onto, and
+//! thaw. Fork children stack their own uppers on that layer (see
+//! [`layers`]).
 //!
 //! Drives (volumes and attached drives) are OverlayBD devices mounted on the
 //! host under the work directory and bound into the container. Volume
@@ -21,6 +27,7 @@
 
 mod bundle;
 mod guest;
+mod layers;
 mod netns;
 mod runtime;
 
@@ -75,6 +82,8 @@ struct ContainerPaths {
     work_base: PathBuf,
     /// The OCI runtime's state directory.
     runtime_root: PathBuf,
+    /// Sealed rootfs layers shared by a sandbox and its forks.
+    layers_base: PathBuf,
 }
 
 impl ContainerPaths {
@@ -82,6 +91,7 @@ impl ContainerPaths {
         Self {
             work_base: config.home_path.join("container/sandboxes"),
             runtime_root: config.runtime_path.join("container/runtime"),
+            layers_base: config.home_path.join("container/layers"),
         }
     }
 }
@@ -124,6 +134,14 @@ impl ContainerSandboxFactory {
             info!(work_dir = %dir.display(), "removing container work directory left by a previous run");
             if let Err(err) = remove_work_dir(&dir) {
                 failures.push(format!("{}: {err:#}", dir.display()));
+            }
+        }
+        // No sandbox stacks on a sealed layer once every work directory is gone.
+        if failures.is_empty() {
+            match std::fs::remove_dir_all(&self.paths.layers_base) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => failures.push(format!("remove sealed layers: {err}")),
             }
         }
         finish(failures)
@@ -282,6 +300,7 @@ impl SandboxBackendFactory for ContainerSandboxFactory {
             launch_config,
             self.runtime.clone(),
             &self.paths,
+            layers::LayerRefs::default(),
         )))
     }
 
@@ -320,6 +339,7 @@ pub struct ContainerSandbox {
     build_spec: FreshSandboxBuildSpec,
     launch: SandboxLaunchConfig,
     runtime: OciRuntime,
+    paths: ContainerPaths,
     work_dir: PathBuf,
     resources: SandboxResources,
     custom_extension_params: Option<CustomExtensionParams>,
@@ -338,6 +358,8 @@ pub struct ContainerSandbox {
     exited: Option<watch::Receiver<ExitState>>,
     envd: Option<EnvdInstance>,
     last_cpu: guest::CpuSample,
+    /// Sealed layers this sandbox's rootfs stacks on.
+    layers: layers::LayerRefs,
 }
 
 impl ContainerSandbox {
@@ -346,6 +368,7 @@ impl ContainerSandbox {
         launch: SandboxLaunchConfig,
         runtime: OciRuntime,
         paths: &ContainerPaths,
+        layers: layers::LayerRefs,
     ) -> Self {
         let id = launch.sandbox_id;
         Self {
@@ -355,6 +378,7 @@ impl ContainerSandbox {
             custom_extension_params: launch.custom_extension_params.clone(),
             network_policy: launch.network.clone(),
             work_dir: paths.work_base.join(id.to_string()),
+            paths: paths.clone(),
             build_spec,
             launch,
             runtime,
@@ -370,7 +394,103 @@ impl ContainerSandbox {
             exited: None,
             envd: None,
             last_cpu: Default::default(),
+            layers,
         }
+    }
+
+    /// Seals the rootfs into a new shared layer directory and returns the
+    /// image config of the sealed stack. The sandbox keeps running on it.
+    async fn seal_rootfs(&mut self) -> SandboxCaptureResult<PathBuf> {
+        let device = self
+            .rootfs
+            .clone()
+            .context("container has no rootfs device")
+            .map_err(SandboxCaptureError::recoverable)?;
+        let live_config = self
+            .rootfs_image_config
+            .clone()
+            .context("container has no rootfs image config")
+            .map_err(SandboxCaptureError::recoverable)?;
+        let rootfs_mount = self.work_dir.join("rootfs");
+        let layer_dir = self
+            .paths
+            .layers_base
+            .join(uuid::Uuid::now_v7().simple().to_string());
+
+        sync_filesystem(&rootfs_mount).map_err(SandboxCaptureError::recoverable)?;
+        freeze(&rootfs_mount).map_err(SandboxCaptureError::recoverable)?;
+        let sealed = restack_snapshot_overlaybd_device(
+            &device,
+            false,
+            &live_config,
+            &layer_dir,
+            "rootfs.commit",
+            "rootfs",
+        )
+        .await;
+        let thawed = thaw(&rootfs_mount);
+        match sealed {
+            Ok(image_config) => {
+                // The live device now stacks on the sealed layer.
+                self.layers.add(layer_dir);
+                if !thawed {
+                    return Err(SandboxCaptureError::terminal(anyhow!(
+                        "thaw rootfs {} after sealing",
+                        rootfs_mount.display()
+                    )));
+                }
+                Ok(image_config)
+            }
+            Err(err) => {
+                let _ = std::fs::remove_dir_all(&layer_dir);
+                let err = SandboxCaptureError::from(err);
+                if thawed || err.is_terminal() {
+                    Err(err)
+                } else {
+                    Err(SandboxCaptureError::terminal(anyhow!(
+                        "{err}; rootfs {} stayed frozen",
+                        rootfs_mount.display()
+                    )))
+                }
+            }
+        }
+    }
+
+    /// A child stacked on the sealed `image_config`: the parent's files,
+    /// shared read-only drives and the child's own volumes, fresh processes.
+    fn fork_child(&self, image_config: &Path, spec: &SandboxForkSpec) -> ContainerSandbox {
+        let mut extra_drives: Vec<ExtraDrive> = self
+            .build_spec
+            .extra_drives
+            .iter()
+            .filter(|drive| !drive.is_volume())
+            .cloned()
+            .collect();
+        extra_drives.extend(spec.extra_drives.iter().cloned());
+        let build_spec = FreshSandboxBuildSpec {
+            backend: self.build_spec.backend,
+            image_config_path: image_config.to_path_buf(),
+            context: self.build_spec.context.clone(),
+            resources: self.resources,
+            extra_drives,
+            extra_boot_args: None,
+        };
+        let launch = SandboxLaunchConfig {
+            sandbox_id: spec.sandbox_id,
+            snapshot_id: self.launch.snapshot_id.clone(),
+            env_vars: self.launch.env_vars.clone(),
+            network: self.network_policy.clone(),
+            custom_extension_params: self.custom_extension_params.clone(),
+            envd_access_token: spec.envd_access_token.clone(),
+            ..Default::default()
+        };
+        ContainerSandbox::new(
+            build_spec,
+            launch,
+            self.runtime.clone(),
+            &self.paths,
+            self.layers.inherit(),
+        )
     }
 
     fn log_path(&self) -> PathBuf {
@@ -733,12 +853,18 @@ impl ContainerSandbox {
         if let Some(device) = self.rootfs.take() {
             if let Err(err) = UblkDeviceManager::global().delete_device(&device).await {
                 failures.push(format!("delete rootfs device: {err:#}"));
+                // Keep it, and the layers under it, for the next attempt.
+                self.rootfs = Some(device);
             }
         }
         if let Some(tools) = self.tools.take() {
             if let Err(err) = tools.release().await {
                 failures.push(format!("release tools drive: {err:#}"));
             }
+        }
+        if self.rootfs.is_none() {
+            // Nothing of this sandbox stacks on its sealed layers any more.
+            self.layers.release();
         }
         if failures.is_empty() {
             if let Err(err) = std::fs::remove_dir_all(&self.work_dir) {
@@ -829,13 +955,44 @@ impl SandboxBackend for ContainerSandbox {
         }
     }
 
+    /// Filesystem-only fork: seal the rootfs once and start each child on its
+    /// own upper over the sealed layer. Children start fresh processes.
     async fn fork(
         &mut self,
-        _spec: &[SandboxForkSpec],
+        spec: &[SandboxForkSpec],
     ) -> SandboxCaptureResult<Vec<SandboxForkResult>> {
-        Err(SandboxCaptureError::recoverable(anyhow!(
-            "container sandboxes cannot be forked"
-        )))
+        if let Some(attached) = self
+            .drives
+            .iter()
+            .find(|attached| !attached.drive.read_only() && !attached.drive.is_volume())
+        {
+            return Err(SandboxCaptureError::recoverable(anyhow!(
+                "cannot fork a container sandbox with writable attached drive '{}'",
+                attached.drive.drive_id()
+            )));
+        }
+        let image_config = self.seal_rootfs().await?;
+        let children: Vec<_> = spec
+            .iter()
+            .map(|child| self.fork_child(&image_config, child))
+            .collect();
+        let started = futures::future::join_all(children.into_iter().map(|mut child| async move {
+            match child.start().await {
+                Ok(()) => Ok(Box::new(child) as Box<dyn SandboxBackend>),
+                Err(err) => {
+                    if let Err(stop_err) = child.stop().await {
+                        warn!(error = %format_args!("{stop_err:#}"), "failed to stop fork child after start failure");
+                    }
+                    Err(err.context("start forked container"))
+                }
+            }
+        }))
+        .await;
+        Ok(started)
+    }
+
+    async fn capture_rootfs(&mut self) -> SandboxCaptureResult<PathBuf> {
+        self.seal_rootfs().await
     }
 
     async fn capture_to_dir(
@@ -957,6 +1114,7 @@ mod tests {
             paths: ContainerPaths {
                 work_base: temp.path().join("missing-work"),
                 runtime_root: temp.path().join("missing-root"),
+                layers_base: temp.path().join("missing-layers"),
             },
         };
         factory.reconcile().await
@@ -974,10 +1132,13 @@ mod tests {
             paths: ContainerPaths {
                 work_base: work_base.clone(),
                 runtime_root: temp.path().join("missing-root"),
+                layers_base: temp.path().join("layers"),
             },
         };
+        std::fs::create_dir_all(temp.path().join("layers/old"))?;
         factory.reconcile().await?;
         assert!(!leftover.exists());
+        assert!(!temp.path().join("layers").exists());
         Ok(())
     }
 }
