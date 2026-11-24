@@ -467,8 +467,9 @@ async fn container_c0() -> Result<()> {
         fs::write(work.join("config.json"), serde_json::to_vec_pretty(&oci_config(&work, hostname, &ctr_id))?)?;
 
         let s = Instant::now();
-        setup_network("ctr0h")?;
+        // Set before setup: teardown tolerates a half-built network.
         network_up = true;
+        setup_network("ctr0h")?;
         t.record("network (slot+veth)", s);
 
         // runc create + start; stdio goes to a log file (pass-through mode).

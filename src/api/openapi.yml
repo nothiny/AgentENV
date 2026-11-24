@@ -914,6 +914,50 @@ components:
             snapshot, so the snapshot is captured once regardless of count.
             Each fork succeeds or fails independently; the outcome of each is
             reported in its entry of the response list.
+        mode:
+          allOf:
+            - $ref: "#/components/schemas/SandboxForkMode"
+          description: What the forks inherit; omitted means `full`.
+
+    SandboxImageRequest:
+      type: object
+      properties:
+        name:
+          type: string
+          description: >
+            Image name: lowercase letters and digits joined by single `.`, `_`
+            or `-`. Defaults to `sandbox-<sandboxID>`.
+        tag:
+          type: string
+          description: Image tag. Defaults to `latest`.
+
+    SandboxImage:
+      type: object
+      required:
+        - image
+        - digest
+        - createdAt
+      properties:
+        image:
+          type: string
+          description: Image reference to cold-start from, `aenv/<name>:<tag>`.
+        digest:
+          type: string
+          description: Content digest of the published image; also accepted as a cold-start image.
+        createdAt:
+          type: string
+          format: date-time
+
+    SandboxForkMode:
+      type: string
+      description: >
+        `full` forks the running sandbox, processes and memory included
+        (`firecracker`). `filesystem` forks only its files: children start
+        fresh processes (`container`). A backend rejects the mode it does not
+        implement.
+      enum:
+        - full
+        - filesystem
 
     SandboxForkResult:
       type: object
@@ -1577,6 +1621,11 @@ components:
           type: integer
           format: uint32
           description: Number of sandboxes running on the node
+        sandboxBackends:
+          type: array
+          description: Sandbox backends the node runs (its enabled_backends).
+          items:
+            $ref: "#/components/schemas/SandboxBackend"
         metrics:
           $ref: "#/components/schemas/NodeMetrics"
         createSuccesses:
@@ -2619,6 +2668,49 @@ paths:
           $ref: "#/components/responses/401"
         "404":
           $ref: "#/components/responses/404"
+        "500":
+          $ref: "#/components/responses/500"
+
+  /sandboxes/{sandboxID}/images:
+    post:
+      summary: Publish the sandbox's root filesystem as an image
+      description: >
+        Seal the running sandbox's root filesystem and publish it to the
+        repository as `aenv/<name>:<tag>`. The sandbox keeps running. Any
+        backend cold-starts from the returned image reference or digest
+        (`POST /sandboxes-cold`). Unlike a snapshot, the image holds no memory
+        or processes. Supported by backends with root filesystem images
+        (`container`).
+      tags: [sandboxes]
+      security:
+        - ApiKeyAuth: []
+        - AuthProviderBearerAuth: []
+          AuthProviderTeamAuth: []
+        - AdminApiKeyAuth: []
+          AdminTeamAuth: []
+      parameters:
+        - $ref: "#/components/parameters/sandboxID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SandboxImageRequest"
+      responses:
+        "201":
+          description: Image published
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SandboxImage"
+        "400":
+          $ref: "#/components/responses/400"
+        "401":
+          $ref: "#/components/responses/401"
+        "404":
+          $ref: "#/components/responses/404"
+        "409":
+          $ref: "#/components/responses/409"
         "500":
           $ref: "#/components/responses/500"
 

@@ -1,6 +1,6 @@
 """Summarize a profile.sh strace: external programs by phase and syscall counts."""
 import collections, re, sys
-out = sys.argv[1] if len(sys.argv) > 1 else "/state/profile"
+out = sys.argv[1] if len(sys.argv) > 1 else "/state/profile/default"
 marks = [l.split() for l in open(f"{out}/marks")]
 marks = [(float(t), name) for t, name in marks]
 start = marks[0][0]

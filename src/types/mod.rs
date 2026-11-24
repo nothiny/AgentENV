@@ -20,7 +20,7 @@ pub use image_tag::{ImageName, ImageTag, DEFAULT_IMAGE_TAG};
 pub use overlaybd_layer::{ExternalLayer, ManagedLayer, OverlaybdLayerRef};
 pub use resources::{bytes_to_mib_ceil, SandboxResources};
 pub use runtime_artifacts::RuntimeArtifactSet;
-pub use sandbox_backend::{BackendCapability, SandboxBackendKind};
+pub use sandbox_backend::{BackendCapability, SandboxBackendKind, SandboxForkMode};
 pub use snapshot_id::{SnapshotAlias, SnapshotId};
 pub use volume_mode::VolumeMode;
 

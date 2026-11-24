@@ -4,7 +4,6 @@
 //! init and exits with it, so the server reaps the runtime process like any
 //! other child and no container process is ever orphaned.
 
-use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
@@ -38,24 +37,19 @@ impl OciRuntime {
         command
     }
 
-    /// Starts `id` from `bundle` in the foreground, with the container's
-    /// stdout and stderr appended to `log`.
-    pub(super) fn run(&self, bundle: &Path, id: &str, log: &Path) -> Result<Child> {
+    /// Starts `id` from `bundle` in the foreground. The container's stdout
+    /// and stderr are piped; the caller drains them.
+    pub(super) fn run(&self, bundle: &Path, id: &str) -> Result<Child> {
         std::fs::create_dir_all(&self.root)
             .with_context(|| format!("create runtime root {}", self.root.display()))?;
-        let log = File::options()
-            .create(true)
-            .append(true)
-            .open(log)
-            .with_context(|| format!("open container log {}", log.display()))?;
         self.command()
             .arg("run")
             .arg("--bundle")
             .arg(bundle)
             .arg(id)
             .stdin(Stdio::null())
-            .stdout(log.try_clone().context("clone container log handle")?)
-            .stderr(log)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
             .spawn()
             .with_context(|| format!("spawn {} run {id}", self.binary))
     }

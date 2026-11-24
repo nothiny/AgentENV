@@ -184,6 +184,34 @@ pub async fn publish_captured(
     snapshots.publish(metadata, manifest, recording).await
 }
 
+/// A root filesystem sealed for publication.
+pub struct CapturedRootfs {
+    image_config: PathBuf,
+    _hold: Box<dyn Any + Send>,
+}
+
+impl CapturedRootfs {
+    /// `hold` keeps `image_config` and its layers valid until dropped.
+    pub fn new<T: Send + 'static>(image_config: PathBuf, hold: T) -> Self {
+        Self {
+            image_config,
+            _hold: Box::new(hold),
+        }
+    }
+
+    pub fn image_config(&self) -> &Path {
+        &self.image_config
+    }
+}
+
+impl fmt::Debug for CapturedRootfs {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CapturedRootfs")
+            .field("image_config", &self.image_config)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Lifecycle interface for a single sandbox instance.
 ///
 /// Implementors must be `Send + 'static` so that they can be stored inside
@@ -277,11 +305,11 @@ pub trait SandboxBackend: Send + 'static {
         at: &Path,
     ) -> SandboxCaptureResult<(SandboxSnapshotManifest, Option<Box<dyn Any + Send>>)>;
 
-    /// Seal the root filesystem into a standalone OverlayBD image config and
-    /// return its path, leaving the sandbox running. The config stays valid
-    /// while the sandbox runs. Backends that cannot do this return a
-    /// recoverable error.
-    async fn capture_rootfs(&mut self) -> SandboxCaptureResult<PathBuf> {
+    /// Seal the root filesystem into a standalone OverlayBD image config,
+    /// leaving the sandbox running. The capture's hold keeps the files the
+    /// config refers to until it is dropped, even if the sandbox goes first.
+    /// Backends that cannot do this return a recoverable error.
+    async fn capture_rootfs(&mut self) -> SandboxCaptureResult<CapturedRootfs> {
         Err(SandboxCaptureError::recoverable(anyhow::anyhow!(
             "this backend cannot capture its root filesystem"
         )))

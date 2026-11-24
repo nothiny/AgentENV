@@ -23,7 +23,8 @@ use crate::sandbox::{
 };
 use crate::snapshot::SnapshotRuntimeVersions;
 use crate::types::{
-    bytes_to_mib_ceil, BackendCapability, SandboxBackendKind, SandboxId, SandboxResources,
+    bytes_to_mib_ceil, BackendCapability, SandboxBackendKind, SandboxForkMode, SandboxId,
+    SandboxResources,
 };
 use crate::volume::VolumeManager;
 
@@ -682,8 +683,13 @@ where
                 ..Default::default()
             })
             .collect();
-        self.fork_sandbox_with_specs(source_sandbox_id, child_specs, new_timeout)
-            .await
+        self.fork_sandbox_with_specs(
+            source_sandbox_id,
+            child_specs,
+            new_timeout,
+            SandboxForkMode::Full,
+        )
+        .await
     }
 
     pub async fn fork_sandbox_with_specs(
@@ -691,8 +697,9 @@ where
         source_sandbox_id: SandboxId,
         child_specs: Vec<SandboxForkChildSpec>,
         new_timeout: NewTimeout,
+        mode: SandboxForkMode,
     ) -> Result<Vec<SandboxForkOutcome>> {
-        self.require_capability(source_sandbox_id, BackendCapability::Fork)
+        self.require_capability(source_sandbox_id, mode.capability())
             .await?;
         let this = Arc::clone(self);
         self.run_cancellation_safe("fork", source_sandbox_id, async move {
@@ -2006,7 +2013,7 @@ where
     pub async fn capture_rootfs(
         self: &Arc<Self>,
         sandbox_id: SandboxId,
-    ) -> Result<(SandboxMetadata, std::path::PathBuf)> {
+    ) -> Result<(SandboxMetadata, crate::sandbox::CapturedRootfs)> {
         self.require_capability(sandbox_id, BackendCapability::RootfsImage)
             .await?;
         let this = Arc::clone(self);
@@ -2019,15 +2026,15 @@ where
     async fn capture_rootfs_inner(
         self: Arc<Self>,
         sandbox_id: SandboxId,
-    ) -> Result<(SandboxMetadata, std::path::PathBuf)> {
+    ) -> Result<(SandboxMetadata, crate::sandbox::CapturedRootfs)> {
         info!("capturing sandbox root filesystem");
         let handle = self.begin_snapshot_operation(sandbox_id).await?;
         let result = {
             let mut sandbox = handle.lock().await;
             sandbox.capture_rootfs().await
         };
-        let image_config = match result {
-            Ok(image_config) => image_config,
+        let captured = match result {
+            Ok(captured) => captured,
             Err(error) => {
                 return self
                     .fail_snapshot_operation(sandbox_id, &handle, error, SandboxOperation::Snapshot)
@@ -2040,7 +2047,7 @@ where
             .get(&sandbox_id)
             .await?
             .ok_or(OrchestratorError::SandboxNotFound(sandbox_id))?;
-        Ok((metadata, image_config))
+        Ok((metadata, captured))
     }
 
     pub async fn replace_sandbox_network_policy(

@@ -69,8 +69,26 @@ impl LayerRefs {
     }
 
     #[cfg(test)]
-    fn count(dir: &std::path::Path) -> usize {
+    pub(super) fn count(dir: &std::path::Path) -> usize {
         REFERENCES.lock().unwrap().get(dir).copied().unwrap_or(0)
+    }
+}
+
+/// References that release themselves when dropped. Handed to whoever
+/// publishes a capture, so the layers outlive the sandbox that sealed them
+/// until the publication is done.
+#[derive(Debug)]
+pub(super) struct LayerHold(LayerRefs);
+
+impl LayerHold {
+    pub(super) fn new(refs: LayerRefs) -> Self {
+        Self(refs)
+    }
+}
+
+impl Drop for LayerHold {
+    fn drop(&mut self) {
+        self.0.release();
     }
 }
 
@@ -96,5 +114,19 @@ mod tests {
         grandchild.release();
         assert!(!dir.exists());
         assert_eq!(LayerRefs::count(&dir), 0);
+    }
+
+    #[test]
+    fn a_hold_keeps_layers_until_dropped() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("layer");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut sandbox = LayerRefs::default();
+        sandbox.add(dir.clone());
+        let hold = LayerHold::new(sandbox.inherit());
+        sandbox.release();
+        assert!(dir.exists(), "the publisher still holds the layer");
+        drop(hold);
+        assert!(!dir.exists());
     }
 }

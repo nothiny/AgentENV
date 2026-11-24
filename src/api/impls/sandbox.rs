@@ -25,8 +25,8 @@ use crate::snapshot::{
     SnapshotVolume,
 };
 use crate::types::{
-    BackendCapability, ImageConfigs, ImageName, ImageTag, SandboxBackendKind, SandboxId,
-    SandboxResources, DEFAULT_IMAGE_TAG,
+    BackendCapability, ImageConfigs, ImageName, ImageTag, SandboxBackendKind, SandboxForkMode,
+    SandboxId, SandboxResources, DEFAULT_IMAGE_TAG,
 };
 use crate::volume::{VolumeManager, VolumeMode};
 use agentenv_http_server::apis::sandboxes::*;
@@ -134,32 +134,39 @@ impl From<models::SandboxBackend> for SandboxBackendKind {
     }
 }
 
-/// Seals a sandbox's root filesystem and publishes it as `aenv/<name>:latest`,
+/// Seals a sandbox's root filesystem and publishes it as `aenv/<name>:<tag>`,
 /// which cold-starts on any backend. Without a name the image is named after
-/// the sandbox. The returned snapshot ID is the image digest.
+/// the sandbox; without a tag it is `latest`. The capture holds the sealed
+/// layers until the upload finishes, so deleting the sandbox meanwhile does
+/// not free them.
 async fn publish_rootfs_image(
     api: &ApiImpl,
     sandbox_id: SandboxId,
-    name: Option<&str>,
-) -> Result<models::SnapshotInfo, models::Error> {
-    let name = name.map_or_else(|| format!("sandbox-{sandbox_id}"), str::to_owned);
+    request: &models::SandboxImageRequest,
+) -> Result<models::SandboxImage, models::Error> {
+    let name = request
+        .name
+        .clone()
+        .unwrap_or_else(|| format!("sandbox-{sandbox_id}"));
+    let tag = request.tag.as_deref().unwrap_or(DEFAULT_IMAGE_TAG);
     let tag = ImageName::parse(&name)
-        .and_then(|name| ImageTag::new(&name, DEFAULT_IMAGE_TAG))
+        .and_then(|name| ImageTag::new(&name, tag))
         .map_err(|err| ApiImpl::error(400, format!("invalid image name: {err:#}")))?;
-    let (metadata, image_config) =
+    let (metadata, captured) =
         api.orchestrator
             .capture_rootfs(sandbox_id)
             .await
             .map_err(|err| match err {
                 OrchestratorError::InvalidSandboxState { state, .. } => ApiImpl::error(
-                    400,
-                    format!("sandbox cannot be snapshotted from {state} state"),
+                    409,
+                    format!("sandbox root filesystem cannot be captured from {state} state"),
                 ),
                 other => other.into(),
             })?;
+    crate::sandbox::failpoint::delay("publish-rootfs-delay").await;
     let image = ResolvedBlockImage {
         image_ref: metadata.snapshot_id.clone(),
-        overlaybd_config_path: image_config,
+        overlaybd_config_path: captured.image_config().to_path_buf(),
         base_context: Default::default(),
         raw_config: metadata.image_configs.rootfs_config().cloned(),
     };
@@ -171,22 +178,16 @@ async fn publish_rootfs_image(
             warn!(error = %format_args!("{err:#}"), %sandbox_id, "failed to publish root filesystem image");
             ApiImpl::error(500, format!("publish root filesystem image: {err:#}"))
         })?;
+    drop(captured);
     api.snapshot_manager
         .repository()
         .put_image_tag(&tag, &digest)
         .await
         .map_err(|err| ApiImpl::error(500, format!("tag root filesystem image: {err}")))?;
-    let reference = format!("aenv/{tag}");
-    let now = chrono::Utc::now();
-    Ok(models::SnapshotInfo {
-        snapshot_id: digest,
-        names: vec![reference.clone()],
-        cpu_count: metadata.resources.cpu_count,
-        memory_mb: metadata.resources.memory_mib,
-        disk_size_mb: metadata.resources.disk_size_mib,
-        created_at: now,
-        updated_at: now,
-        image_ref: Some(reference),
+    Ok(models::SandboxImage {
+        image: format!("aenv/{tag}"),
+        digest,
+        created_at: chrono::Utc::now(),
     })
 }
 
@@ -1773,12 +1774,16 @@ impl Sandboxes<()> for ApiImpl {
             }
         };
 
+        let mode = match body.as_ref().and_then(|b| b.mode) {
+            Some(models::SandboxForkMode::Filesystem) => SandboxForkMode::Filesystem,
+            Some(models::SandboxForkMode::Full) | None => SandboxForkMode::Full,
+        };
         // Reject before the volume snapshot below, which has side effects.
-        if !source_metadata.backend.supports(BackendCapability::Fork) {
+        if !source_metadata.backend.supports(mode.capability()) {
             return Ok(SandboxesSandboxIdForkPostResponse::Status400_BadRequest(
                 OrchestratorError::UnsupportedCapability {
                     backend: source_metadata.backend,
-                    capability: BackendCapability::Fork,
+                    capability: mode.capability(),
                 }
                 .into(),
             ));
@@ -1848,8 +1853,12 @@ impl Sandboxes<()> for ApiImpl {
         match timer
             .time(
                 "fork",
-                self.orchestrator
-                    .fork_sandbox_with_specs(sandbox_id, child_specs, new_timeout),
+                self.orchestrator.fork_sandbox_with_specs(
+                    sandbox_id,
+                    child_specs,
+                    new_timeout,
+                    mode,
+                ),
             )
             .await
         {
@@ -2143,6 +2152,41 @@ impl Sandboxes<()> for ApiImpl {
         }
     }
 
+    async fn sandboxes_sandbox_id_images_post(
+        &self,
+        _method: &Method,
+        _host: &Host,
+        _cookies: &CookieJar,
+        _claims: &Self::Claims,
+        path_params: &models::SandboxesSandboxIdImagesPostPathParams,
+        body: &models::SandboxImageRequest,
+    ) -> Result<SandboxesSandboxIdImagesPostResponse, ()> {
+        let path_id = &path_params.sandbox_id;
+        let Ok(sandbox_id) = SandboxId::parse_str(path_id) else {
+            return Ok(SandboxesSandboxIdImagesPostResponse::Status404_NotFound(
+                sandbox_not_found(path_id),
+            ));
+        };
+        let timer = SandboxStageTimer::new("publish_image");
+        Ok(
+            match timer
+                .time(
+                    "publish_rootfs",
+                    publish_rootfs_image(self, sandbox_id, body),
+                )
+                .await
+            {
+                Ok(image) => SandboxesSandboxIdImagesPostResponse::Status201_ImagePublished(image),
+                Err(error) => match error.code {
+                    404 => SandboxesSandboxIdImagesPostResponse::Status404_NotFound(error),
+                    409 => SandboxesSandboxIdImagesPostResponse::Status409_Conflict(error),
+                    400..=499 => SandboxesSandboxIdImagesPostResponse::Status400_BadRequest(error),
+                    _ => SandboxesSandboxIdImagesPostResponse::Status500_ServerError(error),
+                },
+            },
+        )
+    }
+
     async fn sandboxes_sandbox_id_snapshots_post(
         &self,
         _method: &Method,
@@ -2159,48 +2203,6 @@ impl Sandboxes<()> for ApiImpl {
                 sandbox_not_found(path_id),
             ));
         };
-
-        let backend = match self.orchestrator.get_sandbox(&sandbox_id).await {
-            Ok(Some(metadata)) => metadata.backend,
-            Ok(None) => {
-                return Ok(SandboxesSandboxIdSnapshotsPostResponse::Status404_NotFound(
-                    sandbox_not_found(sandbox_id),
-                ));
-            }
-            Err(err) => {
-                return Ok(
-                    SandboxesSandboxIdSnapshotsPostResponse::Status500_ServerError(err.into()),
-                );
-            }
-        };
-        // Backends without memory snapshots publish their root filesystem
-        // as an image instead.
-        if !backend.supports(BackendCapability::Snapshot)
-            && backend.supports(BackendCapability::RootfsImage)
-        {
-            return Ok(
-                match timer
-                    .time(
-                        "publish_rootfs",
-                        publish_rootfs_image(self, sandbox_id, body.name.as_deref()),
-                    )
-                    .await
-                {
-                    Ok(info) => {
-                        SandboxesSandboxIdSnapshotsPostResponse::Status201_SnapshotCreatedSuccessfully(
-                            info,
-                        )
-                    }
-                    Err(error) => match error.code {
-                        404 => SandboxesSandboxIdSnapshotsPostResponse::Status404_NotFound(error),
-                        400..=499 => {
-                            SandboxesSandboxIdSnapshotsPostResponse::Status400_BadRequest(error)
-                        }
-                        _ => SandboxesSandboxIdSnapshotsPostResponse::Status500_ServerError(error),
-                    },
-                },
-            );
-        }
 
         let alias = match &body.name {
             Some(name) => match SnapshotAlias::parse(name) {

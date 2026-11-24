@@ -179,6 +179,24 @@ pub enum SandboxesSandboxIdGetResponse {
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 #[must_use]
 #[allow(clippy::large_enum_variant)]
+pub enum SandboxesSandboxIdImagesPostResponse {
+    /// Image published
+    Status201_ImagePublished(models::SandboxImage),
+    /// Bad request
+    Status400_BadRequest(models::Error),
+    /// Authentication error
+    Status401_AuthenticationError(models::Error),
+    /// Not found
+    Status404_NotFound(models::Error),
+    /// Conflict
+    Status409_Conflict(models::Error),
+    /// Server error
+    Status500_ServerError(models::Error),
+}
+
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[must_use]
+#[allow(clippy::large_enum_variant)]
 pub enum SandboxesSandboxIdMetricsGetResponse {
     /// Successfully returned the sandbox metrics
     Status200_SuccessfullyReturnedTheSandboxMetrics(Vec<models::SandboxMetric>),
@@ -495,6 +513,20 @@ pub trait Sandboxes<E: std::fmt::Debug + Send + Sync + 'static = ()>:
         claims: &Self::Claims,
         path_params: &models::SandboxesSandboxIdGetPathParams,
     ) -> Result<SandboxesSandboxIdGetResponse, E>;
+
+    /// Publish the sandbox's root filesystem as an image.
+    ///
+    /// SandboxesSandboxIdImagesPost - POST /sandboxes/{sandboxID}/images
+    async fn sandboxes_sandbox_id_images_post(
+        &self,
+
+        method: &Method,
+        host: &Host,
+        cookies: &CookieJar,
+        claims: &Self::Claims,
+        path_params: &models::SandboxesSandboxIdImagesPostPathParams,
+        body: &models::SandboxImageRequest,
+    ) -> Result<SandboxesSandboxIdImagesPostResponse, E>;
 
     /// Sandbox metrics.
     ///

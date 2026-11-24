@@ -7,6 +7,7 @@ mod container_c0;
 pub(crate) mod custom_extension;
 mod envd;
 mod extra_drive;
+pub(crate) mod failpoint;
 mod firecracker;
 mod guest_volumes;
 pub(crate) mod logs;
@@ -36,7 +37,7 @@ pub use crate::types::{
 pub use ::envd::process::Signal;
 pub use access::{EnvdAccessToken, SandboxAccessTokenGenerator};
 pub use backend::{
-    publish_captured, CapturedSandboxSnapshot, PausedSandboxState, SandboxBackend,
+    publish_captured, CapturedRootfs, CapturedSandboxSnapshot, PausedSandboxState, SandboxBackend,
     SandboxBackendFactory, SandboxCaptureError, SandboxCaptureResult, SandboxExecutor,
     SandboxForkResult, SandboxForkSpec, SandboxRuntimeInfo,
 };

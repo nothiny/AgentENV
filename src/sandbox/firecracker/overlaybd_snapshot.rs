@@ -557,6 +557,10 @@ async fn capture_live_overlaybd_snapshot(
         }
     }
 
+    // Tests inject a failure here: the device already stacks on the new
+    // upper, so whatever fails from this point on is terminal.
+    crate::sandbox::failpoint::fail("restack-rewrite-config", None)
+        .map_err(into_terminal_snapshot_failure)?;
     rewrite_live_runtime_config_for_restack(
         live_runtime_image_config_path,
         &snapshot_layer_path,

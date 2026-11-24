@@ -70,6 +70,110 @@ const CAPABILITIES: &[&str] = &[
 
 const CPU_PERIOD_US: u64 = 100_000;
 
+/// Syscalls that reach kernel surface a sandbox has no use for, refused with
+/// EPERM. Docker's default profile refuses the same ones; everything else is
+/// allowed. Most of these already fail without `CAP_SYS_ADMIN` and friends,
+/// and the filter keeps it that way whatever the capability set becomes.
+const DENIED_SYSCALLS: &[&str] = &[
+    "acct",
+    "add_key",
+    "bpf",
+    "clock_adjtime",
+    "clock_settime",
+    "create_module",
+    "delete_module",
+    "finit_module",
+    "fsconfig",
+    "fsmount",
+    "fsopen",
+    "fspick",
+    "get_kernel_syms",
+    "init_module",
+    "ioperm",
+    "iopl",
+    "kcmp",
+    "kexec_file_load",
+    "kexec_load",
+    "keyctl",
+    "lookup_dcookie",
+    "mount",
+    "mount_setattr",
+    "move_mount",
+    "name_to_handle_at",
+    "nfsservctl",
+    "open_by_handle_at",
+    "open_tree",
+    "perf_event_open",
+    "pivot_root",
+    "process_vm_readv",
+    "process_vm_writev",
+    "query_module",
+    "quotactl",
+    "quotactl_fd",
+    "reboot",
+    "request_key",
+    "setns",
+    "settimeofday",
+    "stime",
+    "swapoff",
+    "swapon",
+    "sysfs",
+    "_sysctl",
+    "umount",
+    "umount2",
+    "unshare",
+    "uselib",
+    "userfaultfd",
+    "ustat",
+    "vm86",
+    "vm86old",
+];
+
+/// `clone` flags that create namespaces, refused with EPERM.
+const NAMESPACE_CLONE_FLAGS: &[u64] = &[
+    0x0002_0000, // CLONE_NEWNS
+    0x0200_0000, // CLONE_NEWCGROUP
+    0x0400_0000, // CLONE_NEWUTS
+    0x0800_0000, // CLONE_NEWIPC
+    0x1000_0000, // CLONE_NEWUSER
+    0x2000_0000, // CLONE_NEWPID
+    0x4000_0000, // CLONE_NEWNET
+];
+
+const EPERM: u32 = 1;
+const ENOSYS: u32 = 38;
+
+fn seccomp_architectures() -> &'static [&'static str] {
+    if cfg!(target_arch = "aarch64") {
+        &["SCMP_ARCH_AARCH64", "SCMP_ARCH_ARM"]
+    } else {
+        &["SCMP_ARCH_X86_64", "SCMP_ARCH_X86", "SCMP_ARCH_X32"]
+    }
+}
+
+/// The sandbox's seccomp filter, for `linux.seccomp`.
+pub(super) fn seccomp_profile() -> Value {
+    let mut syscalls = vec![
+        json!({"names": DENIED_SYSCALLS, "action": "SCMP_ACT_ERRNO", "errnoRet": EPERM}),
+        // clone3 passes flags in memory, beyond a filter's reach. Report it
+        // missing so libc falls back to clone, whose flags are checked below.
+        json!({"names": ["clone3"], "action": "SCMP_ACT_ERRNO", "errnoRet": ENOSYS}),
+    ];
+    syscalls.extend(NAMESPACE_CLONE_FLAGS.iter().map(|flag| {
+        json!({
+            "names": ["clone"],
+            "action": "SCMP_ACT_ERRNO",
+            "errnoRet": EPERM,
+            "args": [{"index": 0, "value": flag, "valueTwo": flag, "op": "SCMP_CMP_MASKED_EQ"}]
+        })
+    }));
+    json!({
+        "defaultAction": "SCMP_ACT_ALLOW",
+        "architectures": seccomp_architectures(),
+        "syscalls": syscalls,
+    })
+}
+
 /// A drive mounted on the host and bound into the container.
 pub(super) struct DriveBind {
     pub source: std::path::PathBuf,
@@ -184,6 +288,7 @@ pub(super) fn oci_config(spec: &BundleSpec<'_>) -> Value {
         ],
         "linux": {
             "cgroupsPath": spec.cgroups_path,
+            "seccomp": seccomp_profile(),
             "resources": {
                 "memory": {"limit": memory_bytes, "swap": memory_bytes},
                 "cpu": {"quota": cpu_quota, "period": CPU_PERIOD_US},
@@ -283,6 +388,30 @@ mod tests {
             .unwrap();
         assert!(!caps.contains(&json!("CAP_NET_RAW")));
         assert!(!caps.contains(&json!("CAP_SYS_ADMIN")));
+        let seccomp = &config["linux"]["seccomp"];
+        assert_eq!(seccomp["defaultAction"], "SCMP_ACT_ALLOW");
+        let rules = seccomp["syscalls"].as_array().unwrap();
+        let denied = |name: &str| {
+            rules.iter().any(|rule| {
+                rule["names"].as_array().unwrap().contains(&json!(name)) && rule["args"].is_null()
+            })
+        };
+        for name in ["unshare", "mount", "bpf", "keyctl", "setns", "userfaultfd"] {
+            assert!(denied(name), "{name} must be refused");
+        }
+        let clone3 = rules
+            .iter()
+            .find(|rule| rule["names"] == json!(["clone3"]))
+            .unwrap();
+        assert_eq!(clone3["errnoRet"], 38);
+        let clone_rules: Vec<_> = rules
+            .iter()
+            .filter(|rule| rule["names"] == json!(["clone"]))
+            .collect();
+        assert_eq!(clone_rules.len(), 7);
+        assert!(clone_rules
+            .iter()
+            .all(|rule| rule["args"][0]["op"] == "SCMP_CMP_MASKED_EQ"));
         assert_eq!(
             config["process"]["args"],
             json!(["/agentenv/bin/busybox", "init"])

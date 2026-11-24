@@ -148,6 +148,12 @@ pub struct SandboxesSandboxIdGetPathParams {
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
 #[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct SandboxesSandboxIdImagesPostPathParams {
+    pub sandbox_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
 pub struct SandboxesSandboxIdMetricsGetPathParams {
     pub sandbox_id: String,
 }
@@ -4890,6 +4896,12 @@ pub struct Node {
     #[serde(rename = "sandboxCount")]
     pub sandbox_count: u32,
 
+    /// Sandbox backends the node runs (its enabled_backends).
+    #[serde(rename = "sandboxBackends")]
+    #[validate(nested)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sandbox_backends: Option<Vec<models::SandboxBackend>>,
+
     #[serde(rename = "metrics")]
     #[validate(nested)]
     pub metrics: models::NodeMetrics,
@@ -4938,6 +4950,7 @@ impl Node {
             p2p_endpoint: None,
             status,
             sandbox_count,
+            sandbox_backends: None,
             metrics,
             create_successes,
             create_fails,
@@ -4970,6 +4983,8 @@ impl std::fmt::Display for Node {
             // Skipping status in query parameter serialization
             Some("sandboxCount".to_string()),
             Some(self.sandbox_count.to_string()),
+            // Skipping sandboxBackends in query parameter serialization
+
             // Skipping metrics in query parameter serialization
             Some("createSuccesses".to_string()),
             Some(self.create_successes.to_string()),
@@ -5009,6 +5024,7 @@ impl std::str::FromStr for Node {
             pub p2p_endpoint: Vec<models::P2pEndpoint>,
             pub status: Vec<models::NodeStatus>,
             pub sandbox_count: Vec<u32>,
+            pub sandbox_backends: Vec<Vec<models::SandboxBackend>>,
             pub metrics: Vec<models::NodeMetrics>,
             pub create_successes: Vec<u64>,
             pub create_fails: Vec<u64>,
@@ -5074,6 +5090,12 @@ impl std::str::FromStr for Node {
                     "sandboxCount" => intermediate_rep.sandbox_count.push(
                         <u32 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
                     ),
+                    "sandboxBackends" => {
+                        return std::result::Result::Err(
+                            "Parsing a container in this style is not supported in Node"
+                                .to_string(),
+                        );
+                    }
                     #[allow(clippy::redundant_clone)]
                     "metrics" => intermediate_rep.metrics.push(
                         <models::NodeMetrics as std::str::FromStr>::from_str(val)
@@ -5150,6 +5172,7 @@ impl std::str::FromStr for Node {
                 .into_iter()
                 .next()
                 .ok_or_else(|| "sandboxCount missing in Node".to_string())?,
+            sandbox_backends: intermediate_rep.sandbox_backends.into_iter().next(),
             metrics: intermediate_rep
                 .metrics
                 .into_iter()
@@ -7216,6 +7239,50 @@ impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<SandboxDetai
     }
 }
 
+/// `full` forks the running sandbox, processes and memory included (`firecracker`). `filesystem` forks only its files: children start fresh processes (`container`). A backend rejects the mode it does not implement.
+/// Enumeration of values.
+/// Since this enum's variants do not hold data, we can easily define them as `#[repr(C)]`
+/// which helps with FFI.
+#[allow(non_camel_case_types, clippy::large_enum_variant)]
+#[repr(C)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+#[cfg_attr(feature = "conversion", derive(frunk_enum_derive::LabelledGenericEnum))]
+pub enum SandboxForkMode {
+    #[serde(rename = "full")]
+    Full,
+    #[serde(rename = "filesystem")]
+    Filesystem,
+}
+
+impl validator::Validate for SandboxForkMode {
+    fn validate(&self) -> std::result::Result<(), validator::ValidationErrors> {
+        std::result::Result::Ok(())
+    }
+}
+
+impl std::fmt::Display for SandboxForkMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            SandboxForkMode::Full => write!(f, "full"),
+            SandboxForkMode::Filesystem => write!(f, "filesystem"),
+        }
+    }
+}
+
+impl std::str::FromStr for SandboxForkMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "full" => std::result::Result::Ok(SandboxForkMode::Full),
+            "filesystem" => std::result::Result::Ok(SandboxForkMode::Filesystem),
+            _ => std::result::Result::Err(format!(r#"Value not valid: {s}"#)),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
 #[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
 pub struct SandboxForkRequest {
@@ -7230,6 +7297,12 @@ pub struct SandboxForkRequest {
     #[validate(range(min = 1u32, max = 100u32))]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub count: Option<u32>,
+
+    /// What the forks inherit; omitted means `full`.
+    #[serde(rename = "mode")]
+    #[validate(nested)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<models::SandboxForkMode>,
 }
 
 impl SandboxForkRequest {
@@ -7238,6 +7311,7 @@ impl SandboxForkRequest {
         SandboxForkRequest {
             timeout: None,
             count: Some(1),
+            mode: None,
         }
     }
 }
@@ -7254,6 +7328,7 @@ impl std::fmt::Display for SandboxForkRequest {
             self.count
                 .as_ref()
                 .map(|count| ["count".to_string(), count.to_string()].join(",")),
+            // Skipping mode in query parameter serialization
         ];
 
         write!(
@@ -7277,6 +7352,7 @@ impl std::str::FromStr for SandboxForkRequest {
         struct IntermediateRep {
             pub timeout: Vec<u32>,
             pub count: Vec<u32>,
+            pub mode: Vec<models::SandboxForkMode>,
         }
 
         let mut intermediate_rep = IntermediateRep::default();
@@ -7306,6 +7382,11 @@ impl std::str::FromStr for SandboxForkRequest {
                     "count" => intermediate_rep.count.push(
                         <u32 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
                     ),
+                    #[allow(clippy::redundant_clone)]
+                    "mode" => intermediate_rep.mode.push(
+                        <models::SandboxForkMode as std::str::FromStr>::from_str(val)
+                            .map_err(|x| x.to_string())?,
+                    ),
                     _ => {
                         return std::result::Result::Err(
                             "Unexpected key while parsing SandboxForkRequest".to_string(),
@@ -7322,6 +7403,7 @@ impl std::str::FromStr for SandboxForkRequest {
         std::result::Result::Ok(SandboxForkRequest {
             timeout: intermediate_rep.timeout.into_iter().next(),
             count: intermediate_rep.count.into_iter().next(),
+            mode: intermediate_rep.mode.into_iter().next(),
         })
     }
 }
@@ -7509,6 +7591,334 @@ impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<SandboxForkR
                     }
                     std::result::Result::Err(err) => std::result::Result::Err(format!(
                         r#"Unable to convert header value '{value}' into SandboxForkResult - {err}"#
+                    )),
+                }
+            }
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Unable to convert header: {hdr_value:?} to string: {e}"#
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct SandboxImage {
+    /// Image reference to cold-start from, `aenv/<name>:<tag>`.
+    #[serde(rename = "image")]
+    #[validate(custom(function = "check_xss_string"))]
+    pub image: String,
+
+    /// Content digest of the published image; also accepted as a cold-start image.
+    #[serde(rename = "digest")]
+    #[validate(custom(function = "check_xss_string"))]
+    pub digest: String,
+
+    #[serde(rename = "createdAt")]
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl SandboxImage {
+    #[allow(clippy::new_without_default, clippy::too_many_arguments)]
+    pub fn new(
+        image: String,
+        digest: String,
+        created_at: chrono::DateTime<chrono::Utc>,
+    ) -> SandboxImage {
+        SandboxImage {
+            image,
+            digest,
+            created_at,
+        }
+    }
+}
+
+/// Converts the SandboxImage value to the Query Parameters representation (style=form, explode=false)
+/// specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde serializer
+impl std::fmt::Display for SandboxImage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let params: Vec<Option<String>> = vec![
+            Some("image".to_string()),
+            Some(self.image.to_string()),
+            Some("digest".to_string()),
+            Some(self.digest.to_string()),
+            // Skipping createdAt in query parameter serialization
+        ];
+
+        write!(
+            f,
+            "{}",
+            params.into_iter().flatten().collect::<Vec<_>>().join(",")
+        )
+    }
+}
+
+/// Converts Query Parameters representation (style=form, explode=false) to a SandboxImage value
+/// as specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde deserializer
+impl std::str::FromStr for SandboxImage {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        /// An intermediate representation of the struct to use for parsing.
+        #[derive(Default)]
+        #[allow(dead_code)]
+        struct IntermediateRep {
+            pub image: Vec<String>,
+            pub digest: Vec<String>,
+            pub created_at: Vec<chrono::DateTime<chrono::Utc>>,
+        }
+
+        let mut intermediate_rep = IntermediateRep::default();
+
+        // Parse into intermediate representation
+        let mut string_iter = s.split(',');
+        let mut key_result = string_iter.next();
+
+        while key_result.is_some() {
+            let val = match string_iter.next() {
+                Some(x) => x,
+                None => {
+                    return std::result::Result::Err(
+                        "Missing value while parsing SandboxImage".to_string(),
+                    );
+                }
+            };
+
+            if let Some(key) = key_result {
+                #[allow(clippy::match_single_binding)]
+                match key {
+                    #[allow(clippy::redundant_clone)]
+                    "image" => intermediate_rep.image.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "digest" => intermediate_rep.digest.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "createdAt" => intermediate_rep.created_at.push(
+                        <chrono::DateTime<chrono::Utc> as std::str::FromStr>::from_str(val)
+                            .map_err(|x| x.to_string())?,
+                    ),
+                    _ => {
+                        return std::result::Result::Err(
+                            "Unexpected key while parsing SandboxImage".to_string(),
+                        );
+                    }
+                }
+            }
+
+            // Get the next key
+            key_result = string_iter.next();
+        }
+
+        // Use the intermediate representation to return the struct
+        std::result::Result::Ok(SandboxImage {
+            image: intermediate_rep
+                .image
+                .into_iter()
+                .next()
+                .ok_or_else(|| "image missing in SandboxImage".to_string())?,
+            digest: intermediate_rep
+                .digest
+                .into_iter()
+                .next()
+                .ok_or_else(|| "digest missing in SandboxImage".to_string())?,
+            created_at: intermediate_rep
+                .created_at
+                .into_iter()
+                .next()
+                .ok_or_else(|| "createdAt missing in SandboxImage".to_string())?,
+        })
+    }
+}
+
+// Methods for converting between header::IntoHeaderValue<SandboxImage> and HeaderValue
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<header::IntoHeaderValue<SandboxImage>> for HeaderValue {
+    type Error = String;
+
+    fn try_from(
+        hdr_value: header::IntoHeaderValue<SandboxImage>,
+    ) -> std::result::Result<Self, Self::Error> {
+        let hdr_value = hdr_value.to_string();
+        match HeaderValue::from_str(&hdr_value) {
+            std::result::Result::Ok(value) => std::result::Result::Ok(value),
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Invalid header value for SandboxImage - value: {hdr_value} is invalid {e}"#
+            )),
+        }
+    }
+}
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<SandboxImage> {
+    type Error = String;
+
+    fn try_from(hdr_value: HeaderValue) -> std::result::Result<Self, Self::Error> {
+        match hdr_value.to_str() {
+            std::result::Result::Ok(value) => {
+                match <SandboxImage as std::str::FromStr>::from_str(value) {
+                    std::result::Result::Ok(value) => {
+                        std::result::Result::Ok(header::IntoHeaderValue(value))
+                    }
+                    std::result::Result::Err(err) => std::result::Result::Err(format!(
+                        r#"Unable to convert header value '{value}' into SandboxImage - {err}"#
+                    )),
+                }
+            }
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Unable to convert header: {hdr_value:?} to string: {e}"#
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct SandboxImageRequest {
+    /// Image name: lowercase letters and digits joined by single `.`, `_` or `-`. Defaults to `sandbox-<sandboxID>`.
+    #[serde(rename = "name")]
+    #[validate(custom(function = "check_xss_string"))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+
+    /// Image tag. Defaults to `latest`.
+    #[serde(rename = "tag")]
+    #[validate(custom(function = "check_xss_string"))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tag: Option<String>,
+}
+
+impl SandboxImageRequest {
+    #[allow(clippy::new_without_default, clippy::too_many_arguments)]
+    pub fn new() -> SandboxImageRequest {
+        SandboxImageRequest {
+            name: None,
+            tag: None,
+        }
+    }
+}
+
+/// Converts the SandboxImageRequest value to the Query Parameters representation (style=form, explode=false)
+/// specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde serializer
+impl std::fmt::Display for SandboxImageRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let params: Vec<Option<String>> = vec![
+            self.name
+                .as_ref()
+                .map(|name| ["name".to_string(), name.to_string()].join(",")),
+            self.tag
+                .as_ref()
+                .map(|tag| ["tag".to_string(), tag.to_string()].join(",")),
+        ];
+
+        write!(
+            f,
+            "{}",
+            params.into_iter().flatten().collect::<Vec<_>>().join(",")
+        )
+    }
+}
+
+/// Converts Query Parameters representation (style=form, explode=false) to a SandboxImageRequest value
+/// as specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde deserializer
+impl std::str::FromStr for SandboxImageRequest {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        /// An intermediate representation of the struct to use for parsing.
+        #[derive(Default)]
+        #[allow(dead_code)]
+        struct IntermediateRep {
+            pub name: Vec<String>,
+            pub tag: Vec<String>,
+        }
+
+        let mut intermediate_rep = IntermediateRep::default();
+
+        // Parse into intermediate representation
+        let mut string_iter = s.split(',');
+        let mut key_result = string_iter.next();
+
+        while key_result.is_some() {
+            let val = match string_iter.next() {
+                Some(x) => x,
+                None => {
+                    return std::result::Result::Err(
+                        "Missing value while parsing SandboxImageRequest".to_string(),
+                    );
+                }
+            };
+
+            if let Some(key) = key_result {
+                #[allow(clippy::match_single_binding)]
+                match key {
+                    #[allow(clippy::redundant_clone)]
+                    "name" => intermediate_rep.name.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "tag" => intermediate_rep.tag.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    _ => {
+                        return std::result::Result::Err(
+                            "Unexpected key while parsing SandboxImageRequest".to_string(),
+                        );
+                    }
+                }
+            }
+
+            // Get the next key
+            key_result = string_iter.next();
+        }
+
+        // Use the intermediate representation to return the struct
+        std::result::Result::Ok(SandboxImageRequest {
+            name: intermediate_rep.name.into_iter().next(),
+            tag: intermediate_rep.tag.into_iter().next(),
+        })
+    }
+}
+
+// Methods for converting between header::IntoHeaderValue<SandboxImageRequest> and HeaderValue
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<header::IntoHeaderValue<SandboxImageRequest>> for HeaderValue {
+    type Error = String;
+
+    fn try_from(
+        hdr_value: header::IntoHeaderValue<SandboxImageRequest>,
+    ) -> std::result::Result<Self, Self::Error> {
+        let hdr_value = hdr_value.to_string();
+        match HeaderValue::from_str(&hdr_value) {
+            std::result::Result::Ok(value) => std::result::Result::Ok(value),
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Invalid header value for SandboxImageRequest - value: {hdr_value} is invalid {e}"#
+            )),
+        }
+    }
+}
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<SandboxImageRequest> {
+    type Error = String;
+
+    fn try_from(hdr_value: HeaderValue) -> std::result::Result<Self, Self::Error> {
+        match hdr_value.to_str() {
+            std::result::Result::Ok(value) => {
+                match <SandboxImageRequest as std::str::FromStr>::from_str(value) {
+                    std::result::Result::Ok(value) => {
+                        std::result::Result::Ok(header::IntoHeaderValue(value))
+                    }
+                    std::result::Result::Err(err) => std::result::Result::Err(format!(
+                        r#"Unable to convert header value '{value}' into SandboxImageRequest - {err}"#
                     )),
                 }
             }

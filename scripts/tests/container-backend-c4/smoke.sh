@@ -62,14 +62,18 @@ check "source container" create "$IMAGE" container
 A=$ID
 in_box "$A" 'mkdir -p /opt/app && echo from-template > /opt/app/hello && echo before > /root/state' >/dev/null
 START=$(date +%s%N)
-call POST "/sandboxes/$A/snapshots" "{\"name\":\"$NAME\"}"
+call POST "/sandboxes/$A/images" "{\"name\":\"$NAME\"}"
 ELAPSED_MS=$(( ($(date +%s%N) - START) / 1000000 ))
-check "snapshot publishes an image (${ELAPSED_MS} ms)" test "$STATUS" = 201
-REF=$(jq -r .imageRef <<<"$BODY_OUT")
-DIGEST=$(jq -r .snapshotID <<<"$BODY_OUT")
+check "publish an image (${ELAPSED_MS} ms)" test "$STATUS" = 201
+REF=$(jq -r .image <<<"$BODY_OUT")
+DIGEST=$(jq -r .digest <<<"$BODY_OUT")
 check "response names aenv/$NAME:latest" test "$REF" = "aenv/$NAME:latest"
-check "snapshot ID is the image digest" grep -q '^sha256:' <<<"$DIGEST"
-check "source keeps running after the snapshot" test "$(in_box "$A" 'cat /root/state')" = before
+check "the digest is a content digest" grep -q '^sha256:' <<<"$DIGEST"
+check "source keeps running after the capture" test "$(in_box "$A" 'cat /root/state')" = before
+call POST "/sandboxes/$A/images" "{\"name\":\"$NAME\",\"tag\":\"v1\"}"
+check "publish under an explicit tag" test "$(jq -r .image <<<"$BODY_OUT")" = "aenv/$NAME:v1"
+call POST "/sandboxes/$A/snapshots" "{\"name\":\"$NAME\"}"
+check "memory snapshots are refused on containers (HTTP $STATUS)" test "$STATUS" = 400
 in_box "$A" 'echo after > /root/state' >/dev/null
 
 # --- launch the image on both backends ----------------------------------------
@@ -89,7 +93,10 @@ check "the digest names the same image" test "$(in_box "$D" 'cat /opt/app/hello'
 # --- filesystem-only fork -----------------------------------------------------
 "$AENV" exec "$A" -- sh -c 'sleep 600 >/dev/null 2>&1 &' >/dev/null 2>&1
 START=$(date +%s%N)
-call POST "/sandboxes/$A/fork" '{"count":2}'
+call POST "/sandboxes/$A/fork" '{"count":1}'
+check "a full fork is refused on containers (HTTP $STATUS)" test "$STATUS" = 400
+START=$(date +%s%N)
+call POST "/sandboxes/$A/fork" '{"count":2,"mode":"filesystem"}'
 ELAPSED_MS=$(( ($(date +%s%N) - START) / 1000000 ))
 check "fork into two children (${ELAPSED_MS} ms)" test "$STATUS" = 201
 mapfile -t KIDS < <(jq -r '.[].sandbox.sandboxID // empty' <<<"$BODY_OUT")

@@ -28,8 +28,10 @@
 mod bundle;
 mod guest;
 mod layers;
+mod logfile;
 mod netns;
 mod runtime;
+mod subpath;
 
 use std::any::Any;
 use std::collections::HashMap;
@@ -49,9 +51,9 @@ use self::bundle::{BundleSpec, DriveBind};
 use self::netns::GuestLink;
 use self::runtime::OciRuntime;
 use super::backend::{
-    CapturedSandboxSnapshot, PausedSandboxState, SandboxBackend, SandboxBackendFactory,
-    SandboxCaptureError, SandboxCaptureResult, SandboxForkResult, SandboxForkSpec,
-    SandboxRuntimeInfo,
+    CapturedRootfs, CapturedSandboxSnapshot, PausedSandboxState, SandboxBackend,
+    SandboxBackendFactory, SandboxCaptureError, SandboxCaptureResult, SandboxForkResult,
+    SandboxForkSpec, SandboxRuntimeInfo,
 };
 use super::envd::EnvdInstance;
 use super::extra_drive::{prepare_extra_drives, ExtraDrivePrepareMode};
@@ -159,6 +161,11 @@ fn finish(failures: Vec<String>) -> Result<()> {
 /// Unmounts everything under a sandbox work directory and removes it.
 fn remove_work_dir(dir: &Path) -> Result<()> {
     netns::remove_netns(&dir.join("netns"))?;
+    if let Ok(binds) = std::fs::read_dir(dir.join("binds")) {
+        for bind in binds.flatten() {
+            unmount(&bind.path())?;
+        }
+    }
     if let Ok(drives) = std::fs::read_dir(dir.join("drives")) {
         for drive in drives.flatten() {
             if is_mount_point(&drive.path())? {
@@ -275,8 +282,24 @@ fn sync_filesystem(mount_point: &Path) -> Result<()> {
 struct AttachedDrive {
     drive: ExtraDrive,
     runtime: OverlaybdRuntimeHandle,
+    /// The device's attachment path in the work directory.
+    device: PathBuf,
     /// Host mount point under `drives/`, once mounted.
     host_mount: Option<PathBuf>,
+    /// The pinned `subPath` under `binds/`, once bound.
+    bind: Option<PathBuf>,
+    /// Whether the device has been released.
+    released: bool,
+}
+
+/// The capture failure to report once the caller tried to resume writes.
+/// A terminal error stays terminal; a failed thaw makes any error terminal,
+/// since writes are left stopped.
+fn capture_failure(err: SandboxCaptureError, thawed: Result<()>) -> SandboxCaptureError {
+    match thawed {
+        Ok(()) => err,
+        Err(thaw_err) => SandboxCaptureError::terminal(anyhow!("{err}; {thaw_err:#}")),
+    }
 }
 
 impl AttachedDrive {
@@ -360,6 +383,8 @@ pub struct ContainerSandbox {
     last_cpu: guest::CpuSample,
     /// Sealed layers this sandbox's rootfs stacks on.
     layers: layers::LayerRefs,
+    /// The rootfs sealed with the volumes for the fork that follows.
+    pending_fork_rootfs: Option<PathBuf>,
 }
 
 impl ContainerSandbox {
@@ -395,12 +420,31 @@ impl ContainerSandbox {
             envd: None,
             last_cpu: Default::default(),
             layers,
+            pending_fork_rootfs: None,
         }
     }
 
     /// Seals the rootfs into a new shared layer directory and returns the
     /// image config of the sealed stack. The sandbox keeps running on it.
+    /// Seals the rootfs: freeze, restack, thaw.
     async fn seal_rootfs(&mut self) -> SandboxCaptureResult<PathBuf> {
+        let rootfs_mount = self.work_dir.join("rootfs");
+        sync_filesystem(&rootfs_mount).map_err(SandboxCaptureError::recoverable)?;
+        freeze(&rootfs_mount).map_err(SandboxCaptureError::recoverable)?;
+        self.frozen.push(rootfs_mount);
+        let sealed = self.restack_rootfs().await;
+        let thawed = self.thaw_frozen();
+        match sealed {
+            Ok(image_config) => thawed
+                .map(|()| image_config)
+                .map_err(SandboxCaptureError::terminal),
+            Err(err) => Err(capture_failure(err, thawed)),
+        }
+    }
+
+    /// Restacks the rootfs, whose filesystem the caller has frozen, onto a
+    /// new sealed layer and returns the sealed stack's image config.
+    async fn restack_rootfs(&mut self) -> SandboxCaptureResult<PathBuf> {
         let device = self
             .rootfs
             .clone()
@@ -411,14 +455,10 @@ impl ContainerSandbox {
             .clone()
             .context("container has no rootfs image config")
             .map_err(SandboxCaptureError::recoverable)?;
-        let rootfs_mount = self.work_dir.join("rootfs");
         let layer_dir = self
             .paths
             .layers_base
             .join(uuid::Uuid::now_v7().simple().to_string());
-
-        sync_filesystem(&rootfs_mount).map_err(SandboxCaptureError::recoverable)?;
-        freeze(&rootfs_mount).map_err(SandboxCaptureError::recoverable)?;
         let sealed = restack_snapshot_overlaybd_device(
             &device,
             false,
@@ -428,30 +468,22 @@ impl ContainerSandbox {
             "rootfs",
         )
         .await;
-        let thawed = thaw(&rootfs_mount);
         match sealed {
             Ok(image_config) => {
                 // The live device now stacks on the sealed layer.
                 self.layers.add(layer_dir);
-                if !thawed {
-                    return Err(SandboxCaptureError::terminal(anyhow!(
-                        "thaw rootfs {} after sealing",
-                        rootfs_mount.display()
-                    )));
-                }
                 Ok(image_config)
             }
             Err(err) => {
-                let _ = std::fs::remove_dir_all(&layer_dir);
                 let err = SandboxCaptureError::from(err);
-                if thawed || err.is_terminal() {
-                    Err(err)
+                if err.is_terminal() {
+                    // The device may already stack on the new layer: keep it
+                    // until the device is gone.
+                    self.layers.add(layer_dir);
                 } else {
-                    Err(SandboxCaptureError::terminal(anyhow!(
-                        "{err}; rootfs {} stayed frozen",
-                        rootfs_mount.display()
-                    )))
+                    let _ = std::fs::remove_dir_all(&layer_dir);
                 }
+                Err(err)
             }
         }
     }
@@ -574,18 +606,53 @@ impl ContainerSandbox {
         .await
         .context("prepare drives")?
         .into_parts();
+        // Record every device before mounting any, so `stop` releases all of
+        // them whichever mount fails.
         for ((drive, attachment), runtime) in drives.into_iter().zip(attachments).zip(runtimes) {
-            let device = self.work_dir.join(&attachment.attachment_path);
-            let host_mount = self.work_dir.join("drives").join(drive.drive_id());
-            let read_only = drive.read_only();
-            // Recorded before mounting so `stop` releases the device either way.
             self.drives.push(AttachedDrive {
+                device: self.work_dir.join(&attachment.attachment_path),
                 drive,
                 runtime,
                 host_mount: None,
+                bind: None,
+                released: false,
             });
-            mount_ext4(&device, &host_mount, read_only)?;
-            self.drives.last_mut().expect("just pushed").host_mount = Some(host_mount);
+        }
+        for index in 0..self.drives.len() {
+            let drive_id = self.drives[index].drive.drive_id().to_owned();
+            super::failpoint::fail("container-mount-drive", Some(&drive_id))?;
+            let host_mount = self.work_dir.join("drives").join(&drive_id);
+            let attached = &mut self.drives[index];
+            mount_ext4(&attached.device, &host_mount, attached.drive.read_only())?;
+            attached.host_mount = Some(host_mount.clone());
+            if let Some(sub_path) = attached.drive.sub_path().map(Path::to_path_buf) {
+                let pinned = subpath::open_beneath(&host_mount, &sub_path)
+                    .with_context(|| format!("drive '{drive_id}' subPath"))?;
+                let target = self.work_dir.join("binds").join(&drive_id);
+                subpath::pin(&pinned, &target)?;
+                attached.bind = Some(target);
+            }
+        }
+        Ok(())
+    }
+
+    /// Unbinds, unmounts and releases one drive. Each step is recorded, so a
+    /// failed release can be retried by the next `stop`.
+    async fn release_drive(attached: &mut AttachedDrive) -> Result<()> {
+        if let Some(bind) = &attached.bind {
+            unmount(bind)?;
+            attached.bind = None;
+        }
+        if let Some(host_mount) = &attached.host_mount {
+            unmount(host_mount)?;
+            attached.host_mount = None;
+        }
+        if !attached.released {
+            UblkDeviceManager::global()
+                .release_device(&attached.runtime.device)
+                .await
+                .with_context(|| format!("release drive '{}'", attached.drive.drive_id()))?;
+            attached.released = true;
         }
         Ok(())
     }
@@ -594,10 +661,12 @@ impl ContainerSandbox {
         self.drives
             .iter()
             .filter_map(|attached| {
-                let host_mount = attached.host_mount.as_ref()?;
-                let source = match attached.drive.sub_path() {
-                    Some(sub_path) => host_mount.join(sub_path),
-                    None => host_mount.clone(),
+                // A subPath binds from its pinned staging mount, never from a
+                // path looked up inside the drive.
+                let source = match (&attached.bind, attached.drive.sub_path()) {
+                    (Some(bind), Some(_)) => bind.clone(),
+                    (None, Some(_)) => return None,
+                    (_, None) => attached.host_mount.clone()?,
                 };
                 Some(DriveBind {
                     source,
@@ -655,7 +724,7 @@ impl ContainerSandbox {
     fn thaw_frozen(&mut self) -> Result<()> {
         while let Some(mount) = self.frozen.last() {
             if !thaw(mount) {
-                bail!("thaw volume {}", mount.display());
+                bail!("thaw {}", mount.display());
             }
             self.frozen.pop();
         }
@@ -688,9 +757,14 @@ impl ContainerSandbox {
     }
 
     fn start_runtime(&mut self) -> Result<()> {
-        let mut child = self
-            .runtime
-            .run(&self.work_dir, &self.container_id, &self.log_path())?;
+        let mut child = self.runtime.run(&self.work_dir, &self.container_id)?;
+        let log = logfile::LogFile::new(self.log_path());
+        if let Some(stdout) = child.stdout.take() {
+            logfile::spawn_pump(stdout, Arc::clone(&log));
+        }
+        if let Some(stderr) = child.stderr.take() {
+            logfile::spawn_pump(stderr, log);
+        }
         let (tx, rx) = watch::channel(None);
         let container = self.container_id.clone();
         tokio::spawn(async move {
@@ -827,24 +901,15 @@ impl ContainerSandbox {
         if let Err(err) = self.thaw_frozen() {
             failures.push(format!("{err:#}"));
         }
-        while let Some(attached) = self.drives.pop() {
-            if let Some(host_mount) = &attached.host_mount {
-                if let Err(err) = unmount(host_mount) {
-                    failures.push(format!("{err:#}"));
-                    // Keep the device: it is still mounted.
-                    continue;
-                }
-            }
-            if let Err(err) = UblkDeviceManager::global()
-                .release_device(&attached.runtime.device)
-                .await
-            {
-                failures.push(format!(
-                    "release drive '{}': {err:#}",
-                    attached.drive.drive_id()
-                ));
+        let mut kept = Vec::new();
+        while let Some(mut attached) = self.drives.pop() {
+            if let Err(err) = Self::release_drive(&mut attached).await {
+                failures.push(format!("{err:#}"));
+                kept.push(attached);
             }
         }
+        kept.reverse();
+        self.drives = kept;
         while let Some(path) = self.mounts.pop() {
             if let Err(err) = unmount(&path) {
                 failures.push(format!("{err:#}"));
@@ -937,21 +1002,32 @@ impl SandboxBackend for ContainerSandbox {
         )))
     }
 
+    /// Volume snapshots of a running container precede only a fork, so the
+    /// rootfs is sealed in the same frozen window and kept for that fork:
+    /// children get volumes and a rootfs from one point in time.
     async fn snapshot_volumes(&mut self) -> SandboxCaptureResult<()> {
-        if self.writable_volume_mounts().is_empty() {
-            return Ok(());
+        self.pending_fork_rootfs = None;
+        let result = async {
+            self.freeze_volumes()
+                .map_err(SandboxCaptureError::recoverable)?;
+            let rootfs_mount = self.work_dir.join("rootfs");
+            sync_filesystem(&rootfs_mount).map_err(SandboxCaptureError::recoverable)?;
+            freeze(&rootfs_mount).map_err(SandboxCaptureError::recoverable)?;
+            self.frozen.push(rootfs_mount);
+            self.seal_volumes()
+                .await
+                .map_err(SandboxCaptureError::from)?;
+            self.restack_rootfs().await
         }
-        let result = match self.freeze_volumes() {
-            Ok(()) => self.seal_volumes().await,
-            Err(err) => Err(err),
-        };
-        match (result, self.thaw_frozen()) {
-            (Ok(()), Ok(())) => Ok(()),
-            (Err(err), Ok(())) => Err(SandboxCaptureError::recoverable(err)),
-            (Ok(()), Err(thaw_err)) => Err(SandboxCaptureError::terminal(thaw_err)),
-            (Err(err), Err(thaw_err)) => Err(SandboxCaptureError::terminal(anyhow!(
-                "volume snapshot failed: {err:#}; {thaw_err:#}"
-            ))),
+        .await;
+        let thawed = self.thaw_frozen();
+        match result {
+            Ok(image_config) => {
+                thawed.map_err(SandboxCaptureError::terminal)?;
+                self.pending_fork_rootfs = Some(image_config);
+                Ok(())
+            }
+            Err(err) => Err(capture_failure(err, thawed)),
         }
     }
 
@@ -971,7 +1047,11 @@ impl SandboxBackend for ContainerSandbox {
                 attached.drive.drive_id()
             )));
         }
-        let image_config = self.seal_rootfs().await?;
+        let image_config = match self.pending_fork_rootfs.take() {
+            // Sealed together with the volumes the API forked for children.
+            Some(image_config) => image_config,
+            None => self.seal_rootfs().await?,
+        };
         let children: Vec<_> = spec
             .iter()
             .map(|child| self.fork_child(&image_config, child))
@@ -991,8 +1071,13 @@ impl SandboxBackend for ContainerSandbox {
         Ok(started)
     }
 
-    async fn capture_rootfs(&mut self) -> SandboxCaptureResult<PathBuf> {
-        self.seal_rootfs().await
+    async fn capture_rootfs(&mut self) -> SandboxCaptureResult<CapturedRootfs> {
+        let image_config = self.seal_rootfs().await?;
+        // The publisher keeps the sealed layers even if this sandbox goes.
+        Ok(CapturedRootfs::new(
+            image_config,
+            layers::LayerHold::new(self.layers.inherit()),
+        ))
     }
 
     async fn capture_to_dir(
@@ -1010,17 +1095,14 @@ impl SandboxBackend for ContainerSandbox {
 
     async fn freeze_and_snapshot_volumes(&mut self) -> SandboxCaptureResult<()> {
         let result = match self.freeze_volumes() {
-            Ok(()) => self.seal_volumes().await,
-            Err(err) => Err(err),
+            Ok(()) => self.seal_volumes().await.map_err(SandboxCaptureError::from),
+            Err(err) => Err(SandboxCaptureError::recoverable(err)),
         };
         if let Err(err) = result {
-            // Recoverable errors must leave writes resumed.
-            return Err(match self.thaw_frozen() {
-                Ok(()) => SandboxCaptureError::recoverable(err),
-                Err(thaw_err) => SandboxCaptureError::terminal(anyhow!(
-                    "volume capture failed: {err:#}; {thaw_err:#}"
-                )),
-            });
+            // A recoverable error must leave writes resumed; a terminal one
+            // stays terminal whether or not the thaw works.
+            let thawed = self.thaw_frozen();
+            return Err(capture_failure(err, thawed));
         }
         Ok(())
     }

@@ -72,7 +72,7 @@ check "an exclusive volume cannot be mounted twice (HTTP $STATUS)" test "$STATUS
 
 # Forking copies the volume: the child gets its own copy-on-write volume
 # with the parent's data, sealed through the container's volume snapshot.
-call POST "/sandboxes/$A/fork" '{"count":1}'
+call POST "/sandboxes/$A/fork" '{"count":1,"mode":"filesystem"}'
 check "fork a container with a volume" test "$STATUS" = 201
 K=$(jq -r '.[0].sandbox.sandboxID // empty' <<<"$BODY_OUT")
 check "the child sees the parent's volume data" test "$(in_box "$K" 'cat /data/hello')" = written-by-container

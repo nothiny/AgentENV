@@ -142,18 +142,25 @@ impl EnvdApi for ContainerGuest {
         search: Option<String>,
     ) -> Result<Vec<SandboxLogEntry>> {
         let mut page = LogPage::new(start, end, limit, backward, level, search);
-        let path = self.log.clone();
+        // The rotated generation first, then the live file; the writer keeps
+        // both well under the query limit.
+        let paths = [super::logfile::rotated(&self.log), self.log.clone()];
         let bytes = tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
-            let mut file = match std::fs::File::open(&path) {
-                Ok(file) => file,
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-                Err(err) => return Err(err).with_context(|| format!("open {}", path.display())),
-            };
             let mut bytes = Vec::new();
-            file.by_ref()
-                .take(MAX_LOG_BYTES as u64 + 1)
-                .read_to_end(&mut bytes)
-                .with_context(|| format!("read {}", path.display()))?;
+            for path in paths {
+                let mut file = match std::fs::File::open(&path) {
+                    Ok(file) => file,
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(err) => {
+                        return Err(err).with_context(|| format!("open {}", path.display()))
+                    }
+                };
+                let budget = (MAX_LOG_BYTES as u64 + 1).saturating_sub(bytes.len() as u64);
+                file.by_ref()
+                    .take(budget)
+                    .read_to_end(&mut bytes)
+                    .with_context(|| format!("read {}", path.display()))?;
+            }
             Ok(bytes)
         })
         .await

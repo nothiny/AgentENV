@@ -29,9 +29,10 @@ pub enum BackendCapability {
     RootfsImage,
     /// Launch a sandbox from a committed snapshot or template.
     SnapshotRestore,
-    /// Fork a running sandbox. Container forks copy the filesystem only:
-    /// children start fresh processes.
+    /// Fork a running sandbox, processes and memory included.
     Fork,
+    /// Fork only a running sandbox's files: children start fresh processes.
+    FilesystemFork,
     /// Managed `volumeMounts`.
     ManagedVolumes,
     /// Cold-start `attachedDrives`.
@@ -59,8 +60,12 @@ impl SandboxBackendKind {
     /// What this backend implements today. Grows as container phases land.
     pub fn supports(self, capability: BackendCapability) -> bool {
         match self {
-            // Firecracker publishes its rootfs through snapshot image export.
-            Self::Firecracker => capability != BackendCapability::RootfsImage,
+            // Firecracker publishes its rootfs through snapshot image export,
+            // and its forks are always full.
+            Self::Firecracker => !matches!(
+                capability,
+                BackendCapability::RootfsImage | BackendCapability::FilesystemFork
+            ),
             Self::Container => match capability {
                 // The slot's egress rules match the container's veth, which
                 // keeps the name tap0; drives are mounted on the host and
@@ -70,13 +75,35 @@ impl SandboxBackendKind {
                 | BackendCapability::ManagedVolumes
                 | BackendCapability::AttachedDrives
                 | BackendCapability::RootfsImage
-                | BackendCapability::Fork => true,
+                | BackendCapability::FilesystemFork => true,
                 BackendCapability::Pause
+                | BackendCapability::Fork
                 | BackendCapability::Snapshot
                 | BackendCapability::SnapshotRestore
                 | BackendCapability::ExtraBootArgs
                 | BackendCapability::CustomExtension => false,
             },
+        }
+    }
+}
+
+/// What a fork's children inherit from the source sandbox.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SandboxForkMode {
+    /// Files, memory and running processes.
+    #[default]
+    Full,
+    /// Files only; children start fresh processes.
+    Filesystem,
+}
+
+impl SandboxForkMode {
+    /// The capability a backend needs for this mode.
+    pub fn capability(self) -> BackendCapability {
+        match self {
+            Self::Full => BackendCapability::Fork,
+            Self::Filesystem => BackendCapability::FilesystemFork,
         }
     }
 }
@@ -108,7 +135,8 @@ impl fmt::Display for BackendCapability {
             Self::Snapshot => "snapshot capture",
             Self::RootfsImage => "root filesystem images",
             Self::SnapshotRestore => "launch from a snapshot or template",
-            Self::Fork => "fork",
+            Self::Fork => "full fork (mode \"full\")",
+            Self::FilesystemFork => "filesystem fork (mode \"filesystem\")",
             Self::ManagedVolumes => "volumeMounts",
             Self::AttachedDrives => "attachedDrives",
             Self::ExtraBootArgs => "extraBootArgs",
@@ -158,6 +186,7 @@ mod tests {
             RootfsImage,
             SnapshotRestore,
             Fork,
+            FilesystemFork,
             ManagedVolumes,
             AttachedDrives,
             ExtraBootArgs,
@@ -173,12 +202,12 @@ mod tests {
             .into_iter()
             .filter(|capability| !SandboxBackendKind::Firecracker.supports(*capability))
             .collect();
-        assert_eq!(firecracker, vec![RootfsImage]);
+        assert_eq!(firecracker, vec![RootfsImage, FilesystemFork]);
         assert_eq!(
             container,
             vec![
                 RootfsImage,
-                Fork,
+                FilesystemFork,
                 ManagedVolumes,
                 AttachedDrives,
                 EgressRules,
