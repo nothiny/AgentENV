@@ -782,3 +782,57 @@ func TestSchedulePreservesReportedResourceLimits(t *testing.T) {
 		})
 	}
 }
+
+func TestScheduleRoutesByBackend(t *testing.T) {
+	service := NewService(
+		zap.NewNop(),
+		NewAtomicNodeRegistry([]Node{
+			{ID: "fc", Endpoint: "http://fc"},
+			{ID: "ct", Endpoint: "http://ct"},
+		}, defaultObservedReportTTL),
+		NewStrategy("round_robin"),
+		NewInMemoryBindingStore(defaultObservedReportTTL),
+	)
+	heartbeat := func(nodeID string, backends ...string) {
+		t.Helper()
+		_, err := service.Heartbeat(context.Background(), &schedulerv1.HeartbeatRequest{
+			NodeId: nodeID, ClusterId: "cluster-1", ServiceInstanceId: "svc-" + nodeID,
+			SandboxBackends: backends,
+			Snapshot:        &schedulerv1.NodeSnapshot{Status: schedulerv1.NodeStatus_NODE_STATUS_READY},
+		})
+		if err != nil {
+			t.Fatalf("heartbeat %s: %v", nodeID, err)
+		}
+	}
+	cold := func(backend string) *schedulerv1.ScheduleRequest {
+		return &schedulerv1.ScheduleRequest{Hint: &schedulerv1.ScheduleRequestHint{
+			Kind: &schedulerv1.ScheduleRequestHint_NewColdSandbox{
+				NewColdSandbox: &schedulerv1.NewColdSandboxHint{Backend: backend},
+			},
+		}}
+	}
+	heartbeat("fc", "firecracker")
+
+	// ct has not reported, so it may yet run containers.
+	if _, err := service.Schedule(context.Background(), cold("container")); status.Code(err) != codes.Unavailable {
+		t.Fatalf("container before ct reports: want Unavailable, got %v", err)
+	}
+
+	heartbeat("ct", "container")
+	for i := 0; i < 4; i++ {
+		for backend, want := range map[string]string{"container": "ct", "firecracker": "fc", "": "fc"} {
+			resp, err := service.Schedule(context.Background(), cold(backend))
+			if err != nil {
+				t.Fatalf("backend %q: %v", backend, err)
+			}
+			if got := resp.GetNode().GetNodeId(); got != want {
+				t.Fatalf("backend %q: got node %s, want %s", backend, got, want)
+			}
+		}
+	}
+
+	// Every node has reported and none runs it.
+	if _, err := service.Schedule(context.Background(), cold("qemu")); status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("unknown backend: want InvalidArgument, got %v", err)
+	}
+}

@@ -292,7 +292,10 @@ type NewColdSandboxHint struct {
 	// attached-drive images.
 	Images []string `protobuf:"bytes,3,rep,name=images,proto3" json:"images,omitempty"`
 	// Sandbox metadata key/value pairs parsed from the request body.
-	Metadata      map[string]string `protobuf:"bytes,4,rep,name=metadata,proto3" json:"metadata,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	Metadata map[string]string `protobuf:"bytes,4,rep,name=metadata,proto3" json:"metadata,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	// Requested sandbox backend ("firecracker", "container"). Empty means
+	// firecracker, as on the node API.
+	Backend       string `protobuf:"bytes,5,opt,name=backend,proto3" json:"backend,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -353,6 +356,13 @@ func (x *NewColdSandboxHint) GetMetadata() map[string]string {
 		return x.Metadata
 	}
 	return nil
+}
+
+func (x *NewColdSandboxHint) GetBackend() string {
+	if x != nil {
+		return x.Backend
+	}
+	return ""
 }
 
 // NewSandboxHint describes a POST /sandboxes request.
@@ -1130,8 +1140,11 @@ type ObservedNode struct {
 	MachineInfo       *MachineInfo           `protobuf:"bytes,7,opt,name=machine_info,json=machineInfo,proto3" json:"machine_info,omitempty"`
 	Snapshot          *NodeSnapshot          `protobuf:"bytes,8,opt,name=snapshot,proto3" json:"snapshot,omitempty"`
 	LastSeenUnixMs    int64                  `protobuf:"varint,9,opt,name=last_seen_unix_ms,json=lastSeenUnixMs,proto3" json:"last_seen_unix_ms,omitempty"`
-	unknownFields     protoimpl.UnknownFields
-	sizeCache         protoimpl.SizeCache
+	// Sandbox backends the node runs, as reported in its latest heartbeat.
+	// Empty for nodes that predate the field; they run firecracker only.
+	SandboxBackends []string `protobuf:"bytes,10,rep,name=sandbox_backends,json=sandboxBackends,proto3" json:"sandbox_backends,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *ObservedNode) Reset() {
@@ -1227,6 +1240,13 @@ func (x *ObservedNode) GetLastSeenUnixMs() int64 {
 	return 0
 }
 
+func (x *ObservedNode) GetSandboxBackends() []string {
+	if x != nil {
+		return x.SandboxBackends
+	}
+	return nil
+}
+
 type HeartbeatRequest struct {
 	state             protoimpl.MessageState `protogen:"open.v1"`
 	NodeId            string                 `protobuf:"bytes,1,opt,name=node_id,json=nodeId,proto3" json:"node_id,omitempty"`
@@ -1238,8 +1258,11 @@ type HeartbeatRequest struct {
 	Snapshot          *NodeSnapshot          `protobuf:"bytes,7,opt,name=snapshot,proto3" json:"snapshot,omitempty"`
 	SandboxIds        []string               `protobuf:"bytes,8,rep,name=sandbox_ids,json=sandboxIds,proto3" json:"sandbox_ids,omitempty"`
 	P2PEndpoint       *P2PEndpoint           `protobuf:"bytes,9,opt,name=p2p_endpoint,json=p2pEndpoint,proto3" json:"p2p_endpoint,omitempty"`
-	unknownFields     protoimpl.UnknownFields
-	sizeCache         protoimpl.SizeCache
+	// Sandbox backends the node runs (its enabled_backends). Nodes that do not
+	// send it run firecracker only.
+	SandboxBackends []string `protobuf:"bytes,10,rep,name=sandbox_backends,json=sandboxBackends,proto3" json:"sandbox_backends,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *HeartbeatRequest) Reset() {
@@ -1331,6 +1354,13 @@ func (x *HeartbeatRequest) GetSandboxIds() []string {
 func (x *HeartbeatRequest) GetP2PEndpoint() *P2PEndpoint {
 	if x != nil {
 		return x.P2PEndpoint
+	}
+	return nil
+}
+
+func (x *HeartbeatRequest) GetSandboxBackends() []string {
+	if x != nil {
+		return x.SandboxBackends
 	}
 	return nil
 }
@@ -2319,12 +2349,13 @@ const file_api_proto_scheduler_proto_rawDesc = "" +
 	"\x10new_cold_sandbox\x18\x01 \x01(\v2 .scheduler.v1.NewColdSandboxHintH\x00R\x0enewColdSandbox\x12?\n" +
 	"\vnew_sandbox\x18\x02 \x01(\v2\x1c.scheduler.v1.NewSandboxHintH\x00R\n" +
 	"newSandboxB\x06\n" +
-	"\x04kind\"\xef\x01\n" +
+	"\x04kind\"\x89\x02\n" +
 	"\x12NewColdSandboxHint\x12\x1b\n" +
 	"\tcpu_count\x18\x01 \x01(\rR\bcpuCount\x12\x1b\n" +
 	"\tmemory_mb\x18\x02 \x01(\x04R\bmemoryMb\x12\x16\n" +
 	"\x06images\x18\x03 \x03(\tR\x06images\x12J\n" +
-	"\bmetadata\x18\x04 \x03(\v2..scheduler.v1.NewColdSandboxHint.MetadataEntryR\bmetadata\x1a;\n" +
+	"\bmetadata\x18\x04 \x03(\v2..scheduler.v1.NewColdSandboxHint.MetadataEntryR\bmetadata\x12\x18\n" +
+	"\abackend\x18\x05 \x01(\tR\abackend\x1a;\n" +
 	"\rMetadataEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\x95\x01\n" +
@@ -2388,7 +2419,7 @@ const file_api_proto_scheduler_proto_rawDesc = "" +
 	"\x1dpaused_allocated_memory_bytes\x18\x10 \x01(\x04R\x1apausedAllocatedMemoryBytes\"A\n" +
 	"\vP2pEndpoint\x12\x18\n" +
 	"\abackend\x18\x01 \x01(\tR\abackend\x12\x18\n" +
-	"\aaddress\x18\x02 \x01(\tR\aaddress\"\xe5\x02\n" +
+	"\aaddress\x18\x02 \x01(\tR\aaddress\"\x90\x03\n" +
 	"\fObservedNode\x12\x17\n" +
 	"\anode_id\x18\x01 \x01(\tR\x06nodeId\x12\x1a\n" +
 	"\bendpoint\x18\x02 \x01(\tR\bendpoint\x12\x1d\n" +
@@ -2399,7 +2430,9 @@ const file_api_proto_scheduler_proto_rawDesc = "" +
 	"\x06commit\x18\x06 \x01(\tR\x06commit\x12<\n" +
 	"\fmachine_info\x18\a \x01(\v2\x19.scheduler.v1.MachineInfoR\vmachineInfo\x126\n" +
 	"\bsnapshot\x18\b \x01(\v2\x1a.scheduler.v1.NodeSnapshotR\bsnapshot\x12)\n" +
-	"\x11last_seen_unix_ms\x18\t \x01(\x03R\x0elastSeenUnixMs\"\x81\x03\n" +
+	"\x11last_seen_unix_ms\x18\t \x01(\x03R\x0elastSeenUnixMs\x12)\n" +
+	"\x10sandbox_backends\x18\n" +
+	" \x03(\tR\x0fsandboxBackends\"\xac\x03\n" +
 	"\x10HeartbeatRequest\x12\x17\n" +
 	"\anode_id\x18\x01 \x01(\tR\x06nodeId\x12\x1d\n" +
 	"\n" +
@@ -2411,7 +2444,9 @@ const file_api_proto_scheduler_proto_rawDesc = "" +
 	"\bsnapshot\x18\a \x01(\v2\x1a.scheduler.v1.NodeSnapshotR\bsnapshot\x12\x1f\n" +
 	"\vsandbox_ids\x18\b \x03(\tR\n" +
 	"sandboxIds\x12<\n" +
-	"\fp2p_endpoint\x18\t \x01(\v2\x19.scheduler.v1.P2pEndpointR\vp2pEndpoint\";\n" +
+	"\fp2p_endpoint\x18\t \x01(\v2\x19.scheduler.v1.P2pEndpointR\vp2pEndpoint\x12)\n" +
+	"\x10sandbox_backends\x18\n" +
+	" \x03(\tR\x0fsandboxBackends\";\n" +
 	"\x11HeartbeatResponse\x12&\n" +
 	"\x0fcpu_config_json\x18\x01 \x01(\tR\rcpuConfigJson\"\xf9\x01\n" +
 	"\fSandboxEvent\x12\x1d\n" +

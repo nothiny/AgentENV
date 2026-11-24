@@ -45,6 +45,9 @@ message NewColdSandboxHint {
   repeated string images = 3;
   // Sandbox metadata key/value pairs parsed from the request body.
   map<string, string> metadata = 4;
+  // Requested sandbox backend ("firecracker", "container"). Empty means
+  // firecracker, as on the node API.
+  string backend = 5;
 }
 
 // NewSandboxHint describes a POST /sandboxes request.
@@ -156,6 +159,9 @@ message ObservedNode {
   MachineInfo machine_info = 7;
   NodeSnapshot snapshot = 8;
   int64 last_seen_unix_ms = 9;
+  // Sandbox backends the node runs, as reported in its latest heartbeat.
+  // Empty for nodes that predate the field; they run firecracker only.
+  repeated string sandbox_backends = 10;
 }
 
 message HeartbeatRequest {
@@ -168,6 +174,9 @@ message HeartbeatRequest {
   NodeSnapshot snapshot = 7;
   repeated string sandbox_ids = 8;
   P2pEndpoint p2p_endpoint = 9;
+  // Sandbox backends the node runs (its enabled_backends). Nodes that do not
+  // send it run firecracker only.
+  repeated string sandbox_backends = 10;
 }
 
 message HeartbeatResponse {

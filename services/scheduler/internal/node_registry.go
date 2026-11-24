@@ -213,6 +213,7 @@ func (r *AtomicNodeRegistry) heartbeatLocked(req *schedulerv1.HeartbeatRequest, 
 			MachineInfo:       machineInfo,
 			LastSeenUnixMs:    nowMs,
 			Snapshot:          cloneSnapshot(req.GetSnapshot()),
+			SandboxBackends:   append([]string(nil), req.GetSandboxBackends()...),
 		},
 		p2pEndpoint:  cloneP2PEndpoint(req.GetP2PEndpoint()),
 		reportTTL:    r.observedTTL,
@@ -404,6 +405,7 @@ func (r *AtomicNodeRegistry) SchedulingSnapshot(nodeID string) *SchedulingSnapsh
 		PausedSandboxCount:         snapshot.GetPausedSandboxCount(),
 		PausedAllocatedCpu:         snapshot.GetPausedAllocatedCpu(),
 		PausedAllocatedMemoryBytes: snapshot.GetPausedAllocatedMemoryBytes(),
+		SandboxBackends:            append([]string(nil), record.node.GetSandboxBackends()...),
 	}
 }
 

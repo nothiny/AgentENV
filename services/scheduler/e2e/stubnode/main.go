@@ -36,8 +36,11 @@ type stub struct {
 	id        string
 	clusterID string
 	apiKey    string
-	state     *stubState
-	client    schedulerv1.SchedulerClient
+	// backends is reported as sandbox_backends; empty reports nothing, as
+	// a node that predates the field does.
+	backends []string
+	state    *stubState
+	client   schedulerv1.SchedulerClient
 }
 
 func main() {
@@ -47,6 +50,7 @@ func main() {
 	clusterID := flag.String("cluster-id", "e2e", "cluster id")
 	apiKey := flag.String("api-key", os.Getenv("AENV_API_KEY"), "admin API key for /nodes and /sandboxes")
 	interval := flag.Duration("interval", 5*time.Second, "heartbeat interval")
+	backends := flag.String("sandbox-backends", "", "comma-separated sandbox backends to report; empty reports none")
 	flag.Parse()
 
 	conn, err := grpc.NewClient(*schedulerAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
@@ -59,6 +63,7 @@ func main() {
 		id:        *id,
 		clusterID: *clusterID,
 		apiKey:    *apiKey,
+		backends:  splitBackends(*backends),
 		state:     &stubState{sandboxIDs: []string{}, cpuPercent: 5},
 		client:    schedulerv1.NewSchedulerClient(conn),
 	}
@@ -68,6 +73,8 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /nodes", s.withAuth(s.handleNodes))
 	mux.HandleFunc("GET /sandboxes", s.withAuth(s.handleSandboxes))
+	mux.HandleFunc("POST /sandboxes-cold", s.handleCreate)
+	mux.HandleFunc("POST /sandboxes", s.handleCreate)
 	mux.HandleFunc("POST /control/metrics", s.handleSetMetrics)
 	mux.HandleFunc("POST /control/sandboxes", s.handleSetSandboxes)
 	mux.HandleFunc("POST /control/assign", s.handleAssign)
@@ -150,9 +157,27 @@ func (s *stub) heartbeatRequest() *schedulerv1.HeartbeatRequest {
 			MemoryTotalBytes: 8 << 30,
 			SandboxCount:     s.state.sandboxCount,
 		},
-		SandboxIds:  append([]string(nil), s.state.sandboxIDs...),
-		P2PEndpoint: &schedulerv1.P2PEndpoint{Backend: "iroh", Address: s.id + ".p2p.e2e"},
+		SandboxIds:      append([]string(nil), s.state.sandboxIDs...),
+		P2PEndpoint:     &schedulerv1.P2PEndpoint{Backend: "iroh", Address: s.id + ".p2p.e2e"},
+		SandboxBackends: append([]string(nil), s.backends...),
 	}
+}
+
+func splitBackends(raw string) []string {
+	var backends []string
+	for _, backend := range strings.Split(raw, ",") {
+		if backend = strings.TrimSpace(backend); backend != "" {
+			backends = append(backends, backend)
+		}
+	}
+	return backends
+}
+
+// handleCreate answers a sandbox create with this node's ID, so a test
+// driver can see where the gateway placed it.
+func (s *stub) handleCreate(w http.ResponseWriter, _ *http.Request) {
+	w.WriteHeader(http.StatusCreated)
+	writeJSON(w, map[string]any{"sandboxID": "stub-" + s.id, "nodeID": s.id})
 }
 
 func (s *stub) handleNodes(w http.ResponseWriter, _ *http.Request) {
@@ -171,6 +196,7 @@ func (s *stub) handleNodes(w http.ResponseWriter, _ *http.Request) {
 		"sandboxStartingCount": 0,
 		"sandboxPausedCount":   0,
 		"p2pEndpoint":          map[string]string{"backend": "iroh", "address": s.id + ".p2p.e2e"},
+		"sandboxBackends":      s.backends,
 		"machineInfo": map[string]string{
 			"cpuFamily":       "e2e",
 			"cpuModel":        "e2e",

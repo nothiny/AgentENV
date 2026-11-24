@@ -432,6 +432,11 @@ impl ObservabilityReporter {
                 backend: endpoint.backend.clone(),
                 address: endpoint.address.clone(),
             }),
+            sandbox_backends: snapshot
+                .sandbox_backends
+                .iter()
+                .map(|backend| backend.as_str().to_owned())
+                .collect(),
         }
     }
 

@@ -63,6 +63,7 @@ type nodeListItem struct {
 	CreateFails          uint64              `json:"createFails"`
 	SandboxStartingCount uint32              `json:"sandboxStartingCount"`
 	SandboxPausedCount   uint32              `json:"sandboxPausedCount"`
+	SandboxBackends      []string            `json:"sandboxBackends,omitempty"`
 }
 
 func isNodeListRequest(r *http.Request) bool {
@@ -133,8 +134,9 @@ func (s *Server) handleNodeList(w http.ResponseWriter, r *http.Request, routingC
 				CPUModelName:    observed.GetMachineInfo().GetCpuModelName(),
 				CPUArchitecture: observed.GetMachineInfo().GetCpuArchitecture(),
 			},
-			Status:       nodeStatusToString(snapshot.GetStatus()),
-			SandboxCount: snapshot.GetSandboxCount(),
+			Status:          nodeStatusToString(snapshot.GetStatus()),
+			SandboxCount:    snapshot.GetSandboxCount(),
+			SandboxBackends: observed.GetSandboxBackends(),
 			Metrics: nodeListMetrics{
 				AllocatedCPU:               snapshot.GetAllocatedCpu(),
 				AllocatedMemoryBytes:       snapshot.GetAllocatedMemoryBytes(),

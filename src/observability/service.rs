@@ -117,6 +117,9 @@ impl ObservabilityService {
             sandbox_starting_count: runtime.starting_sandbox_count,
             paused_sandbox_count: runtime.paused_sandbox_count,
             p2p_endpoint: self.p2p_endpoint.clone(),
+            sandbox_backends: crate::cfg::ConfigManager::global_config()
+                .enabled_backends
+                .clone(),
         })
     }
 

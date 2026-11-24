@@ -1,8 +1,10 @@
 package scheduler
 
 import (
+	"slices"
 	"testing"
 
+	schedulerv1 "agentenv/services/api/proto"
 	"agentenv/services/shared/config"
 )
 
@@ -207,5 +209,55 @@ func TestFilterIncludingPausedExcludesNodeWithinActiveLimits(t *testing.T) {
 	result := FilterByResourceLimit(nodes, limit)
 	if len(result) != 1 || result[0].ID != "ok" {
 		t.Fatalf("expected [ok], got %v", result)
+	}
+}
+
+func TestRequiredBackend(t *testing.T) {
+	cold := func(backend string) *schedulerv1.ScheduleRequestHint {
+		return &schedulerv1.ScheduleRequestHint{Kind: &schedulerv1.ScheduleRequestHint_NewColdSandbox{
+			NewColdSandbox: &schedulerv1.NewColdSandboxHint{Backend: backend},
+		}}
+	}
+	for _, test := range []struct {
+		name string
+		hint *schedulerv1.ScheduleRequestHint
+		want string
+	}{
+		{"no hint", nil, ""},
+		{"cold start without backend", cold(""), DefaultSandboxBackend},
+		{"cold start names a backend", cold(" Container "), "container"},
+		{"template launch", &schedulerv1.ScheduleRequestHint{Kind: &schedulerv1.ScheduleRequestHint_NewSandbox{
+			NewSandbox: &schedulerv1.NewSandboxHint{},
+		}}, DefaultSandboxBackend},
+	} {
+		if got := RequiredBackend(test.hint); got != test.want {
+			t.Errorf("%s: got %q, want %q", test.name, got, test.want)
+		}
+	}
+}
+
+func TestFilterByBackend(t *testing.T) {
+	nodes := []RichNode{
+		{Node: Node{ID: "unreported"}},
+		{Node: Node{ID: "legacy"}, Snapshot: &SchedulingSnapshot{}},
+		{Node: Node{ID: "container"}, Snapshot: &SchedulingSnapshot{SandboxBackends: []string{"container"}}},
+		{Node: Node{ID: "both"}, Snapshot: &SchedulingSnapshot{SandboxBackends: []string{"firecracker", "container"}}},
+	}
+	ids := func(nodes []RichNode) []string {
+		out := make([]string, 0, len(nodes))
+		for _, n := range nodes {
+			out = append(out, n.ID)
+		}
+		return out
+	}
+	for backend, want := range map[string][]string{
+		"":            {"unreported", "legacy", "container", "both"},
+		"firecracker": {"unreported", "legacy", "both"},
+		"container":   {"container", "both"},
+		"qemu":        {},
+	} {
+		if got := ids(FilterByBackend(nodes, backend)); !slices.Equal(got, want) {
+			t.Errorf("backend %q: got %v, want %v", backend, got, want)
+		}
 	}
 }

@@ -73,6 +73,12 @@ impl From<NodeSnapshot> for models::Node {
         out.p2p_endpoint = node
             .p2p_endpoint
             .map(|ep| models::P2pEndpoint::new(ep.backend, ep.address));
+        out.sandbox_backends = Some(
+            node.sandbox_backends
+                .into_iter()
+                .map(models::SandboxBackend::from)
+                .collect(),
+        );
         out
     }
 }

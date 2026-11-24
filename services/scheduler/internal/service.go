@@ -119,6 +119,20 @@ func (s *Service) Schedule(_ context.Context, req *schedulerv1.ScheduleRequest) 
 
 	rich = s.filterFreshObservations(rich)
 
+	if backend := RequiredBackend(req.GetHint()); backend != "" {
+		runs := FilterByBackend(rich, backend)
+		if len(runs) == 0 && len(rich) > 0 {
+			if anyUnreported(rich) {
+				// A node that has not reported yet may run it.
+				err = status.Errorf(codes.Unavailable, "no node running the %s backend is available", backend)
+			} else {
+				err = status.Errorf(codes.InvalidArgument, "no node in the cluster runs the %s backend", backend)
+			}
+			return nil, err
+		}
+		rich = runs
+	}
+
 	eligible := FilterByResourceLimit(rich, s.resourceLimit)
 
 	node, selectErr := s.strategy.Select(eligible, req.GetHint())
@@ -146,6 +160,16 @@ func (s *Service) Schedule(_ context.Context, req *schedulerv1.ScheduleRequest) 
 		zap.Int("eligible_nodes", len(eligible)),
 	)
 	return &schedulerv1.ScheduleResponse{Node: node.Node.ToProto()}, nil
+}
+
+// anyUnreported reports whether some node has not sent a heartbeat yet.
+func anyUnreported(nodes []RichNode) bool {
+	for _, n := range nodes {
+		if n.Snapshot == nil {
+			return true
+		}
+	}
+	return false
 }
 
 // filterFreshObservations applies the fresh-observations-only rule (#259):

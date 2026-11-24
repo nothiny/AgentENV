@@ -95,6 +95,7 @@ func (b *prefixedBody) Close() error { return b.closer.Close() }
 // (src/api/openapi.yml) that is relevant for scheduling.
 type newColdSandboxBody struct {
 	Image          string            `json:"image"`
+	Backend        string            `json:"backend"`
 	CPUCount       uint32            `json:"cpuCount"`
 	MemoryMB       uint64            `json:"memoryMB"`
 	Metadata       map[string]string `json:"metadata"`
@@ -119,6 +120,7 @@ func parseNewColdSandboxHint(body []byte) *schedulerv1.NewColdSandboxHint {
 	}
 	hint.CpuCount = parsed.CPUCount
 	hint.MemoryMb = parsed.MemoryMB
+	hint.Backend = parsed.Backend
 	hint.Metadata = parsed.Metadata
 	if parsed.Image != "" {
 		hint.Images = append(hint.Images, parsed.Image)

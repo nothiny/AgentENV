@@ -30,6 +30,9 @@ type SchedulingSnapshot struct {
 	PausedSandboxCount         uint32
 	PausedAllocatedCpu         uint32
 	PausedAllocatedMemoryBytes uint64
+	// SandboxBackends are the backends the node reported. Empty for nodes
+	// that predate the report; they run DefaultSandboxBackend only.
+	SandboxBackends []string
 }
 
 func (n Node) ToProto() *schedulerv1.Node {

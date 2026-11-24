@@ -10,6 +10,12 @@ Go implementation of a distributed Gateway and pluggable Scheduler for AgentENV.
 - Gateway resolves `GET /nodes/{id}` via scheduler and proxies to the target node.
 - Gateway routes sandbox requests by existing sandbox-to-node binding.
 - Scheduler exposes gRPC API and supports pluggable strategy providers.
+- Scheduler places a create only on nodes that run its sandbox backend: nodes report
+  their `enabled_backends` in heartbeats, cold starts name a `backend` (default
+  `firecracker`), and template launches need `firecracker`. Nodes that report no
+  backends run `firecracker` only. With no node running the backend, scheduling fails
+  with `InvalidArgument` (HTTP 400 at the gateway), or `Unavailable` (503) while some
+  node has not reported yet.
 - Built-in strategies in v1: round_robin and random.
 - Scheduler supports both static node configuration and Kubernetes EndpointSlice discovery.
 - Scheduler sandbox binding store can be in-memory or Redis-backed.

@@ -51,4 +51,7 @@ pub struct NodeSnapshot {
     pub paused_sandbox_count: u32,
     /// The node's P2P artifact transport endpoint, when P2P is enabled.
     pub p2p_endpoint: Option<P2pEndpoint>,
+    /// Sandbox backends this node runs, so the scheduler places each create
+    /// on a node that can serve it.
+    pub sandbox_backends: Vec<crate::types::SandboxBackendKind>,
 }
