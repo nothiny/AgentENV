@@ -3608,7 +3608,7 @@ pub struct NewColdSandbox {
     #[validate(custom(function = "check_xss_string"))]
     pub image: String,
 
-    /// Runtime for the sandbox; omitted means `firecracker`. Requests for a backend the node does not run, or for capabilities the backend lacks, return HTTP 400 before any resources are allocated. For `container`, `autoPause` defaults to false and may not be true.
+    /// Runtime for the sandbox; omitted means `firecracker`. Requests for a backend the node does not run, or for capabilities the backend lacks, return HTTP 400 before any resources are allocated. `autoPause` behaves the same on both backends where the node can pause containers (its OCI runtime is runc or crun and CRIU is installed): omitted means pause on timeout. On a node that cannot, container sandboxes are deleted on timeout and `autoPause: true` or `autoResume` returns HTTP 400.
     #[serde(rename = "backend")]
     #[validate(nested)]
     #[serde(skip_serializing_if = "Option::is_none")]

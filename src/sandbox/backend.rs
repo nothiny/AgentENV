@@ -43,6 +43,14 @@ pub trait PausedSandboxState: Any + fmt::Debug + Send + Sync + 'static {
     fn control_plane_port(&self) -> Option<u16> {
         None
     }
+    /// The backend that captured this state and can resume it.
+    fn backend(&self) -> crate::types::SandboxBackendKind {
+        crate::types::SandboxBackendKind::Firecracker
+    }
+    /// Called once a resume from this state has committed: drops artifacts
+    /// only the resume needed. Artifacts the running sandbox still uses
+    /// (layers its devices stack on) stay until the sandbox is deleted.
+    fn release_after_resume(&self) {}
 }
 
 impl dyn PausedSandboxState {
@@ -372,8 +380,10 @@ pub trait SandboxBackendFactory: Send + Sync + 'static {
     ) -> Result<Box<dyn SandboxBackend>>;
 
     /// Decode backend-specific paused state loaded from persistence.
+    /// `backend` is the paused sandbox's backend, from its metadata.
     fn decode_paused_state(
         &self,
+        backend: crate::types::SandboxBackendKind,
         artifact_root: PathBuf,
         state: Value,
     ) -> Result<Arc<dyn PausedSandboxState>>;

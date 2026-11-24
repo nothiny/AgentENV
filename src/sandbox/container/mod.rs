@@ -11,9 +11,15 @@
 //!
 //! Supported: cold start, exec, files, proxy, delete, egress rules, network
 //! policy updates, managed volumes, attached drives, root filesystem capture
-//! for publishing as an image, and filesystem-only forks. Pause and
-//! memory snapshots are rejected before they reach this backend (see
+//! for publishing as an image, filesystem-only forks, and pause. Memory
+//! snapshots and full forks are rejected before they reach this backend (see
 //! `SandboxBackendKind::supports`).
+//!
+//! Pause freezes the container, dumps its processes with CRIU and seals the
+//! rootfs and drives into the paused sandbox's artifact root, all while the
+//! processes stay frozen; `stop` then releases everything (see [`paused`]).
+//! Resume builds a new sandbox on the sealed rootfs and drives, with a new
+//! network slot and cgroup, and `runc restore`s the processes into it.
 //!
 //! Capture and fork both seal the rootfs: freeze its host mount, turn the
 //! writable upper into a read-only layer the live device restacks onto, and
@@ -30,6 +36,7 @@ mod guest;
 mod layers;
 mod logfile;
 mod netns;
+mod paused;
 mod runtime;
 mod subpath;
 
@@ -49,6 +56,7 @@ use uvm_ublk_daemon::CreateOverlaybdRuntimeDeviceRequest;
 
 use self::bundle::{BundleSpec, DriveBind};
 use self::netns::GuestLink;
+use self::paused::ContainerPausedState;
 use self::runtime::OciRuntime;
 use super::backend::{
     CapturedRootfs, CapturedSandboxSnapshot, PausedSandboxState, SandboxBackend,
@@ -57,7 +65,9 @@ use super::backend::{
 };
 use super::envd::EnvdInstance;
 use super::extra_drive::{prepare_extra_drives, ExtraDrivePrepareMode};
-use super::firecracker::restack_snapshot_overlaybd_device;
+use super::firecracker::{
+    restack_snapshot_overlaybd_device, stage_overlaybd_snapshot_from_live_runtime,
+};
 use super::network::{NetworkManager, SlotLease};
 use super::process::Executor;
 use super::ublk::{OverlaybdRuntimeHandle, SharedReadOnlyDevice, UblkCreateSpec, UblkDevice};
@@ -76,6 +86,10 @@ const CGROUP_PARENT: &str = "/aenv-container";
 const HOSTNAME: &str = "instance";
 const DEFAULT_PIDS_LIMIT: u32 = 4096;
 const STOP_TIMEOUT: Duration = Duration::from_secs(10);
+/// How often a resume checks whether CRIU has finished restoring.
+const RESTORE_POLL: Duration = Duration::from_millis(10);
+/// The first envd probe after a restore; later ones back off to the usual.
+const RESTORE_FIRST_PROBE: Duration = Duration::from_millis(100);
 
 /// Where container sandboxes keep their state, from the node config.
 #[derive(Clone, Debug)]
@@ -93,9 +107,15 @@ impl ContainerPaths {
         Self {
             work_base: config.home_path.join("container/sandboxes"),
             runtime_root: config.runtime_path.join("container/runtime"),
-            layers_base: config.home_path.join("container/layers"),
+            layers_base: sealed_layers_base(config),
         }
     }
+}
+
+/// Where sealed rootfs layers live. Startup reconciliation removes them, so
+/// snapshots that outlive a restart adopt them into their own artifacts.
+pub(crate) fn sealed_layers_base(config: &AppConfig) -> PathBuf {
+    config.home_path.join("container/layers")
 }
 
 pub struct ContainerSandboxFactory {
@@ -104,10 +124,20 @@ pub struct ContainerSandboxFactory {
 }
 
 impl ContainerSandboxFactory {
+    /// Also records whether this node can pause container sandboxes, which
+    /// decides what create, timeout and shutdown do with them.
     pub fn from_config(config: &AppConfig) -> Self {
         let paths = ContainerPaths::from_config(config);
+        let runtime = config.container.runtime.clone();
+        match pause_support(&runtime) {
+            Ok(()) => crate::types::set_container_pause_available(true),
+            Err(reason) => {
+                warn!(runtime = %runtime, %reason, "container sandboxes cannot pause on this node; timeouts delete them");
+                crate::types::set_container_pause_available(false);
+            }
+        }
         Self {
-            runtime: OciRuntime::new(config.container.runtime.clone(), &paths.runtime_root),
+            runtime: OciRuntime::new(runtime, &paths.runtime_root),
             paths,
         }
     }
@@ -148,6 +178,56 @@ impl ContainerSandboxFactory {
         }
         finish(failures)
     }
+}
+
+/// Whether `runtime` can pause containers here: the dump and restore pass
+/// runc's CRIU options (`--tcp-established`, `--file-locks`, a CRIU config
+/// annotation), which runc and crun take and runsc does not, and CRIU must
+/// be installed.
+fn pause_support(runtime: &str) -> std::result::Result<(), String> {
+    if !runtime_checkpoints_with_criu(runtime) {
+        return Err(format!("{runtime} does not checkpoint with CRIU"));
+    }
+    match std::process::Command::new("criu").arg("--version").output() {
+        Ok(output) if output.status.success() => {}
+        Ok(output) => return Err(format!("criu --version failed: {}", output.status)),
+        Err(err) => return Err(format!("criu is not available: {err}")),
+    }
+    // crun links CRIU in as a library, loaded when it checkpoints.
+    if Path::new(runtime)
+        .file_name()
+        .and_then(|name| name.to_str())
+        == Some("crun")
+    {
+        let version = std::process::Command::new(runtime)
+            .arg("--version")
+            .output()
+            .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+            .map_err(|err| format!("{runtime} --version: {err}"))?;
+        if !version.contains("+CRIU") {
+            return Err(format!("{runtime} was built without CRIU"));
+        }
+        let libraries = std::process::Command::new("ldconfig")
+            .arg("-p")
+            .output()
+            .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+            .map_err(|err| format!("ldconfig -p: {err}"))?;
+        if !libraries.contains("libcriu.so.2") {
+            return Err(
+                "libcriu.so.2, which crun loads to checkpoint, is not installed".to_owned(),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn runtime_checkpoints_with_criu(runtime: &str) -> bool {
+    matches!(
+        Path::new(runtime)
+            .file_name()
+            .and_then(|name| name.to_str()),
+        Some("runc" | "crun")
+    )
 }
 
 fn finish(failures: Vec<String>) -> Result<()> {
@@ -278,6 +358,16 @@ fn sync_filesystem(mount_point: &Path) -> Result<()> {
     nix::unistd::syncfs(&dir).with_context(|| format!("syncfs {}", mount_point.display()))
 }
 
+/// Stages a copy of the sealed stack `sealed` into `output_dir`: its
+/// sandbox-owned layers are hard-linked there, so the copy outlives the
+/// sealed-layer directory, and the live device never depends on the copy.
+async fn stage_into(sealed: &Path, output_dir: &Path) -> SandboxCaptureResult<PathBuf> {
+    stage_overlaybd_snapshot_from_live_runtime(sealed, output_dir, None)
+        .await
+        .with_context(|| format!("stage {} into {}", sealed.display(), output_dir.display()))
+        .map_err(SandboxCaptureError::recoverable)
+}
+
 /// A drive attached to a container sandbox.
 struct AttachedDrive {
     drive: ExtraDrive,
@@ -337,19 +427,68 @@ impl SandboxBackendFactory for ContainerSandboxFactory {
 
     fn decode_paused_state(
         &self,
+        _backend: crate::types::SandboxBackendKind,
         _artifact_root: PathBuf,
-        _state: Value,
+        state: Value,
     ) -> Result<Arc<dyn PausedSandboxState>> {
-        bail!("container sandboxes cannot be paused")
+        // A runtime mismatch is refused when resuming, not here: refusing at
+        // load would discard a dump that a reconfigured node can still use.
+        Ok(Arc::new(ContainerPausedState::decode(state)?))
     }
 
+    /// A sandbox that rebuilds the paused one's devices, network and cgroup
+    /// and restores its processes from the dump. envd gets a fresh token
+    /// and the environment again once it answers.
     fn build_from_paused_state(
         &self,
-        _sandbox_id: SandboxId,
-        _state: &dyn PausedSandboxState,
-        _envd_access_token: Option<EnvdAccessToken>,
+        sandbox_id: SandboxId,
+        state: &dyn PausedSandboxState,
+        envd_access_token: Option<EnvdAccessToken>,
     ) -> Result<Box<dyn SandboxBackend>> {
-        bail!("container sandboxes cannot be paused")
+        if !nix::unistd::Uid::effective().is_root() {
+            bail!("the container backend requires the server to run as root");
+        }
+        let state = state
+            .downcast_ref::<ContainerPausedState>()
+            .context("paused state is not a container's")?;
+        if !runtime::same_executable(&state.runtime, self.runtime.binary()) {
+            bail!(
+                "paused container was dumped by {} but this node runs {}",
+                state.runtime,
+                self.runtime.binary()
+            );
+        }
+        let build_spec = FreshSandboxBuildSpec {
+            backend: crate::types::SandboxBackendKind::Container,
+            image_config_path: state.rootfs_image_config.clone(),
+            context: state.context.clone(),
+            resources: state.resources,
+            extra_drives: state.extra_drives.clone(),
+            extra_boot_args: None,
+        };
+        let launch = SandboxLaunchConfig {
+            sandbox_id,
+            snapshot_id: state.snapshot_id.clone(),
+            env_vars: state.env_vars.clone(),
+            network: state.network.clone(),
+            custom_extension_params: state.custom_extension_params.clone(),
+            envd_access_token,
+            ..Default::default()
+        };
+        let mut sandbox = ContainerSandbox::new(
+            build_spec,
+            launch,
+            self.runtime.clone(),
+            &self.paths,
+            layers::LayerRefs::default(),
+        );
+        sandbox.restore = Some(Restore {
+            criu_dir: state.criu_dir.clone(),
+            tools_image_config: state.tools_image_config.clone(),
+            rootfs_virtual_size: state.rootfs_virtual_size,
+            envd_port: state.envd_port,
+        });
+        Ok(Box::new(sandbox))
     }
 }
 
@@ -385,6 +524,18 @@ pub struct ContainerSandbox {
     layers: layers::LayerRefs,
     /// The rootfs sealed with the volumes for the fork that follows.
     pending_fork_rootfs: Option<PathBuf>,
+    /// Set when this sandbox resumes a paused one instead of starting fresh.
+    restore: Option<Restore>,
+}
+
+/// What resuming a paused container takes from its persisted state, beyond
+/// the build spec: the dump and the exact tools image and sizes it ran with.
+#[derive(Clone, Debug)]
+struct Restore {
+    criu_dir: PathBuf,
+    tools_image_config: PathBuf,
+    rootfs_virtual_size: Option<u64>,
+    envd_port: u16,
 }
 
 impl ContainerSandbox {
@@ -421,6 +572,7 @@ impl ContainerSandbox {
             last_cpu: Default::default(),
             layers,
             pending_fork_rootfs: None,
+            restore: None,
         }
     }
 
@@ -455,17 +607,32 @@ impl ContainerSandbox {
             .clone()
             .context("container has no rootfs image config")
             .map_err(SandboxCaptureError::recoverable)?;
+        self.seal_layer(&device, &live_config, "rootfs.commit", "rootfs")
+            .await
+    }
+
+    /// Restacks a writable device, whose filesystem the caller has frozen,
+    /// onto a new sealed layer in its own directory under the sealed-layer
+    /// base, which this sandbox references until its devices are gone.
+    /// Returns the sealed stack's image config.
+    async fn seal_layer(
+        &mut self,
+        device: &UblkDevice,
+        live_config: &Path,
+        layer_file: &str,
+        kind: &'static str,
+    ) -> SandboxCaptureResult<PathBuf> {
         let layer_dir = self
             .paths
             .layers_base
             .join(uuid::Uuid::now_v7().simple().to_string());
         let sealed = restack_snapshot_overlaybd_device(
-            &device,
+            device,
             false,
-            &live_config,
+            live_config,
             &layer_dir,
-            "rootfs.commit",
-            "rootfs",
+            layer_file,
+            kind,
         )
         .await;
         match sealed {
@@ -486,6 +653,155 @@ impl ContainerSandbox {
                 Err(err)
             }
         }
+    }
+
+    /// Dumps the frozen processes into `root` and seals the rootfs and drives
+    /// there, in that order and in one frozen window, so the files match the
+    /// memory image. The processes stay frozen; the file systems are thawed.
+    async fn capture_paused(&mut self, root: &Path) -> SandboxCaptureResult<ContainerPausedState> {
+        let tools_image_config = self
+            .tools
+            .as_ref()
+            .map(|tools| tools.image_config_path().to_path_buf())
+            .context("container has no tools drive")
+            .map_err(SandboxCaptureError::recoverable)?;
+        let criu_dir = root.join("criu");
+        self.runtime
+            .checkpoint(&self.container_id, &criu_dir, &self.criu_work_dir())
+            .await
+            .context("dump container processes")
+            .map_err(SandboxCaptureError::recoverable)?;
+        super::failpoint::fail("container-pause-seal", None)
+            .map_err(SandboxCaptureError::recoverable)?;
+
+        let sealed = async {
+            for mount in self.writable_drive_mounts() {
+                sync_filesystem(&mount).map_err(SandboxCaptureError::recoverable)?;
+                freeze(&mount).map_err(SandboxCaptureError::recoverable)?;
+                self.frozen.push(mount);
+            }
+            let rootfs_mount = self.work_dir.join("rootfs");
+            sync_filesystem(&rootfs_mount).map_err(SandboxCaptureError::recoverable)?;
+            freeze(&rootfs_mount).map_err(SandboxCaptureError::recoverable)?;
+            self.frozen.push(rootfs_mount);
+            let rootfs = self.seal_rootfs_into(&root.join("rootfs")).await?;
+            let drives = self.seal_drives_into(&root.join("drives")).await?;
+            Ok::<_, SandboxCaptureError>((rootfs, drives))
+        }
+        .await;
+        let thawed = self.thaw_frozen();
+        let (rootfs_image_config, extra_drives) = match sealed {
+            Ok(sealed) => {
+                thawed.map_err(SandboxCaptureError::terminal)?;
+                sealed
+            }
+            Err(err) => return Err(capture_failure(err, thawed)),
+        };
+
+        Ok(ContainerPausedState {
+            version: paused::STATE_VERSION,
+            runtime: self.runtime.binary().to_owned(),
+            criu_dir,
+            rootfs_image_config,
+            rootfs_virtual_size: self.rootfs_virtual_size,
+            tools_image_config,
+            extra_drives,
+            resources: self.resources,
+            context: self.build_spec.context.clone(),
+            snapshot_id: self.launch.snapshot_id.clone(),
+            env_vars: self.launch.env_vars.clone(),
+            network: self.network_policy.clone(),
+            custom_extension_params: self.custom_extension_params.clone(),
+            envd_port: self.envd_port(ConfigManager::global_config()),
+        })
+    }
+
+    /// Seals the rootfs, whose filesystem the caller has frozen, and stages
+    /// the sealed stack into `output_dir`; returns the staged image config.
+    async fn seal_rootfs_into(&mut self, output_dir: &Path) -> SandboxCaptureResult<PathBuf> {
+        let sealed = self.restack_rootfs().await?;
+        stage_into(&sealed, output_dir).await
+    }
+
+    /// Seals the drives, whose writable filesystems the caller has frozen,
+    /// and returns them pointing at image configs that outlive this sandbox:
+    /// - a volume: restacked in its own directory under a unique layer name,
+    ///   as Firecracker's pause does;
+    /// - a writable attached drive: sealed like the rootfs and staged under
+    ///   `output_dir`;
+    /// - a read-only drive: its own image config, which nothing has changed.
+    async fn seal_drives_into(
+        &mut self,
+        output_dir: &Path,
+    ) -> SandboxCaptureResult<Vec<ExtraDrive>> {
+        let mut sealed = Vec::with_capacity(self.drives.len());
+        for index in 0..self.drives.len() {
+            let drive = self.drives[index].drive.clone();
+            let device = self.drives[index].runtime.device.clone();
+            let live_config = self.drives[index].runtime.image_config_path.clone();
+            let virtual_size = self.drives[index].runtime.actual_virtual_size;
+            let image_config = if let Some(volume_dir) = drive.snapshot_output_dir() {
+                let layer = format!("snapshot-{}.commit", uuid::Uuid::now_v7().simple());
+                Some(
+                    restack_snapshot_overlaybd_device(
+                        &device,
+                        drive.read_only(),
+                        &live_config,
+                        volume_dir,
+                        &layer,
+                        "volume",
+                    )
+                    .await
+                    .map_err(SandboxCaptureError::from),
+                )
+            } else if drive.read_only() {
+                None
+            } else {
+                let sealed = self
+                    .seal_layer(&device, &live_config, "drive.commit", "drive")
+                    .await;
+                Some(match sealed {
+                    Ok(sealed) => stage_into(&sealed, &output_dir.join(drive.drive_id())).await,
+                    Err(err) => Err(err),
+                })
+            };
+            let drive = match image_config {
+                Some(Ok(image_config)) => drive.with_image_config_path(image_config),
+                Some(Err(err)) => {
+                    return Err(match err {
+                        SandboxCaptureError::Terminal(err) => SandboxCaptureError::terminal(
+                            err.context(format!("seal drive '{}'", drive.drive_id())),
+                        ),
+                        SandboxCaptureError::Recoverable(err) => SandboxCaptureError::recoverable(
+                            err.context(format!("seal drive '{}'", drive.drive_id())),
+                        ),
+                    })
+                }
+                None => drive,
+            };
+            sealed.push(
+                drive
+                    .try_with_virtual_size(virtual_size)
+                    .map_err(SandboxCaptureError::recoverable)?,
+            );
+        }
+        Ok(sealed)
+    }
+
+    /// Host mounts of the drives the sandbox can write.
+    fn writable_drive_mounts(&self) -> Vec<PathBuf> {
+        self.drives
+            .iter()
+            .filter(|attached| !attached.drive.read_only())
+            .filter_map(|attached| attached.host_mount.clone())
+            .collect()
+    }
+
+    /// Thaws file systems and processes a pause left frozen.
+    async fn thaw_paused(&mut self) -> Result<()> {
+        let thawed = self.thaw_frozen();
+        let resumed = self.runtime.resume(&self.container_id).await;
+        thawed.and(resumed)
     }
 
     /// A child stacked on the sealed `image_config`: the parent's files,
@@ -540,9 +856,13 @@ impl ContainerSandbox {
 
     async fn attach_storage(&mut self, config: &AppConfig) -> Result<()> {
         let global_config = config.ublk.overlaybd.global_config_path.clone();
-        let tools_config = resolve_tools_image(config, config.resolved_tools_version())
-            .await?
-            .context("the container backend needs an OverlayBD tools image")?;
+        let tools_config = match &self.restore {
+            // The restored processes map envd and busybox from this image.
+            Some(restore) => restore.tools_image_config.clone(),
+            None => resolve_tools_image(config, config.resolved_tools_version())
+                .await?
+                .context("the container backend needs an OverlayBD tools image")?,
+        };
         let tools = UblkDeviceManager::global()
             .get_or_create_shared_tools(&UblkCreateSpec::Overlaybd {
                 image_config: tools_config,
@@ -553,14 +873,20 @@ impl ContainerSandbox {
         let tools_device = tools.device_path().to_path_buf();
         self.tools = Some(tools);
 
-        let requested_virtual_size = match self.resources.disk_size_mib {
-            0 => None,
-            mib => Some(
+        let requested_virtual_size = match (&self.restore, self.resources.disk_size_mib) {
+            // A resumed filesystem keeps the size it was paused with.
+            (Some(restore), _) => restore.rootfs_virtual_size,
+            (None, 0) => None,
+            (None, mib) => Some(
                 u64::from(mib)
                     .checked_mul(1024 * 1024)
                     .context("requested rootfs size overflows bytes")?,
             ),
         };
+        let known_source_virtual_size = self
+            .restore
+            .as_ref()
+            .and_then(|restore| restore.rootfs_virtual_size);
         let rootfs = UblkDeviceManager::global()
             .create_overlaybd_runtime_device(CreateOverlaybdRuntimeDeviceRequest {
                 source_image_config: &self.build_spec.image_config_path,
@@ -569,8 +895,8 @@ impl ContainerSandbox {
                 read_only: false,
                 runtime_upper_mode: config.ublk.overlaybd.runtime_upper_mode,
                 requested_virtual_size,
-                known_source_virtual_size: None,
-                allow_shrink: config.ublk.overlaybd.allow_shrink,
+                known_source_virtual_size,
+                allow_shrink: self.restore.is_none() && config.ublk.overlaybd.allow_shrink,
             })
             .await
             .context("create rootfs device")?;
@@ -595,13 +921,19 @@ impl ContainerSandbox {
         if drives.is_empty() {
             return Ok(());
         }
-        let allow_shrink = config.ublk.overlaybd.allow_shrink;
+        let mode = match self.restore {
+            // Sealed drives carry the sizes they were paused with.
+            Some(_) => ExtraDrivePrepareMode::Resume,
+            None => ExtraDrivePrepareMode::Fresh {
+                allow_shrink: config.ublk.overlaybd.allow_shrink,
+            },
+        };
         let (attachments, runtimes) = prepare_extra_drives(
             &drives,
             global_config,
             &self.work_dir,
             config.ublk.overlaybd.runtime_upper_mode,
-            |_| ExtraDrivePrepareMode::Fresh { allow_shrink },
+            |_| mode,
         )
         .await
         .context("prepare drives")?
@@ -757,7 +1089,18 @@ impl ContainerSandbox {
     }
 
     fn start_runtime(&mut self) -> Result<()> {
-        let mut child = self.runtime.run(&self.work_dir, &self.container_id)?;
+        let mut child = match &self.restore {
+            Some(restore) => {
+                super::failpoint::fail("container-restore", None)?;
+                self.runtime.restore(
+                    &self.work_dir,
+                    &self.container_id,
+                    &restore.criu_dir,
+                    &self.criu_work_dir(),
+                )?
+            }
+            None => self.runtime.run(&self.work_dir, &self.container_id)?,
+        };
         let log = logfile::LogFile::new(self.log_path());
         if let Some(stdout) = child.stdout.take() {
             logfile::spawn_pump(stdout, Arc::clone(&log));
@@ -779,6 +1122,19 @@ impl ContainerSandbox {
         Ok(())
     }
 
+    /// CRIU's work directory: its logs for a dump or restore.
+    fn criu_work_dir(&self) -> PathBuf {
+        self.work_dir.join("criu")
+    }
+
+    /// envd's port: the one a restored envd already listens on, or the
+    /// node's.
+    fn envd_port(&self, config: &AppConfig) -> u16 {
+        self.restore
+            .as_ref()
+            .map_or(config.tools.control_plane_port, |restore| restore.envd_port)
+    }
+
     async fn start_inner(&mut self) -> Result<()> {
         let config = ConfigManager::global_config();
         std::fs::create_dir_all(&self.work_dir)
@@ -798,35 +1154,75 @@ impl ContainerSandbox {
             nameservers: &[dns],
             resources: self.resources,
             pids_limit: DEFAULT_PIDS_LIMIT,
-            envd_port: config.tools.control_plane_port,
+            envd_port: self.envd_port(config),
             cgroups_path: &cgroups_path,
             drives: &self.drive_binds(),
+            restore: self.restore.is_some(),
         })?;
         self.start_runtime()?;
 
         let host_ip = self.host_interaction_ip().context("network slot missing")?;
         self.envd = Some(EnvdInstance::new(
-            format!("http://{host_ip}:{}", config.tools.control_plane_port),
+            format!("http://{host_ip}:{}", self.envd_port(config)),
             self.launch.envd_access_token.clone(),
         ));
-        info!(container = %self.container_id, work_dir = %self.work_dir.display(), "container started");
+        info!(
+            container = %self.container_id,
+            work_dir = %self.work_dir.display(),
+            restored = self.restore.is_some(),
+            "container started"
+        );
         Ok(())
+    }
+
+    /// Waits until the runtime reports a restored container running. CRIU
+    /// drops the container's packets until the restore is complete, so an
+    /// earlier envd probe would only time out.
+    /// The caller bounds the whole wait.
+    async fn wait_restored(&self) -> Result<()> {
+        loop {
+            if self.runtime.status(&self.container_id).await?.as_deref() == Some("running") {
+                return Ok(());
+            }
+            tokio::time::sleep(RESTORE_POLL).await;
+        }
     }
 
     async fn ready_inner(&self) -> Result<()> {
         let config = ConfigManager::global_config();
         let envd = self.envd.as_ref().context("container has not started")?;
         let mut exited = self.exited.clone().context("container has not started")?;
-        let ready = envd.wait_for_ready(
-            Duration::from_secs(config.envd.init_timeout_secs),
-            Duration::from_millis(config.envd.poll_ms),
-        );
+        let timeout = Duration::from_secs(config.envd.init_timeout_secs);
+        let started = std::time::Instant::now();
+        // One deadline covers waiting for the restore and for envd.
+        let ready = tokio::time::timeout(timeout, async {
+            let poll = Duration::from_millis(config.envd.poll_ms);
+            if self.restore.is_none() {
+                return envd.wait_for_ready(timeout, poll).await;
+            }
+            self.wait_restored().await?;
+            debug!(container = %self.container_id, elapsed = ?started.elapsed(), "container restored");
+            // The runtime reports the container running just before CRIU
+            // stops dropping its packets: retry dropped probes quickly.
+            let remaining = timeout.saturating_sub(started.elapsed());
+            envd.wait_for_ready_probing(remaining, poll, RESTORE_FIRST_PROBE)
+                .await
+        });
         tokio::select! {
-            result = ready => result?,
+            result = ready => result.map_err(|_| {
+                anyhow!("container was not ready within {}s", timeout.as_secs())
+            })??,
             changed = exited.wait_for(Option::is_some) => {
                 let exit = changed
                     .map(|exit| exit.clone().unwrap_or_default())
                     .unwrap_or_else(|_| "unknown".to_owned());
+                let criu = match self.restore {
+                    Some(_) => runtime::criu_errors(&self.criu_work_dir().join("restore.log")),
+                    None => String::new(),
+                };
+                if !criu.is_empty() {
+                    bail!("container restore failed ({exit}): criu: {criu}");
+                }
                 bail!(
                     "container exited before envd was ready ({exit}); see {}",
                     self.log_path().display()
@@ -852,13 +1248,16 @@ impl ContainerSandbox {
         if let Some(launch_env) = &self.launch.env_vars {
             env_vars.extend(launch_env.clone());
         }
+        debug!(container = %self.container_id, elapsed = ?started.elapsed(), "envd answers");
         envd.init(
             (!env_vars.is_empty()).then_some(env_vars),
             Some(context.workdir.clone()),
             context.user.clone(),
         )
         .await
-        .context("initialize envd")
+        .context("initialize envd")?;
+        debug!(container = %self.container_id, elapsed = ?started.elapsed(), "envd initialized");
+        Ok(())
     }
 
     async fn stop_inner(&mut self) -> Result<()> {
@@ -949,10 +1348,6 @@ impl ContainerSandbox {
             ))
         }
     }
-
-    fn unsupported<T>(&self, operation: &str) -> Result<T> {
-        bail!("container sandbox {} does not support {operation}", self.id)
-    }
 }
 
 #[async_trait]
@@ -983,17 +1378,54 @@ impl SandboxBackend for ContainerSandbox {
         self.ready_inner().await
     }
 
+    /// Persistent pause: freeze the processes, dump them and seal the file
+    /// systems into `artifact_root`. The processes stay frozen until `stop`
+    /// releases everything, or until `resume` thaws them if the pause is not
+    /// kept. Any failure thaws them again.
     async fn pause(
         &mut self,
-        _artifact_root: Option<&Path>,
+        artifact_root: Option<&Path>,
     ) -> SandboxCaptureResult<Arc<dyn PausedSandboxState>> {
-        Err(SandboxCaptureError::recoverable(anyhow!(
-            "container sandboxes cannot be paused"
-        )))
+        let root = artifact_root
+            .context("pausing a container sandbox needs an artifact root")
+            .map_err(SandboxCaptureError::recoverable)?;
+        if self
+            .exited
+            .as_ref()
+            .is_some_and(|exited| exited.borrow().is_some())
+        {
+            // Nothing is left to keep running: the sandbox must be cleaned up,
+            // not put back.
+            return Err(SandboxCaptureError::terminal(anyhow!(
+                "container sandbox {} has exited",
+                self.id
+            )));
+        }
+        self.runtime
+            .pause(&self.container_id)
+            .await
+            .map_err(SandboxCaptureError::recoverable)?;
+        match self.capture_paused(root).await {
+            Ok(state) => {
+                info!(container = %self.container_id, root = %root.display(), "container paused");
+                Ok(Arc::new(state))
+            }
+            Err(err) => {
+                // The live devices stack only on sealed layers this sandbox
+                // references, never on the artifact root: drop what the
+                // failed pause wrote there.
+                for dir in ["criu", "rootfs", "drives"] {
+                    let _ = std::fs::remove_dir_all(root.join(dir));
+                }
+                let resumed = self.thaw_paused().await;
+                Err(capture_failure(err, resumed))
+            }
+        }
     }
 
+    /// Thaws a paused container that has not been stopped yet.
     async fn resume(&mut self) -> Result<()> {
-        self.unsupported("resume")
+        self.thaw_paused().await
     }
 
     async fn snapshot(&mut self) -> SandboxCaptureResult<CapturedSandboxSnapshot> {
@@ -1186,6 +1618,14 @@ mod tests {
             points,
             vec!["/mnt/a b".to_string(), "/work/x/rootfs".to_string()]
         );
+    }
+
+    #[test]
+    fn only_criu_runtimes_can_pause() {
+        assert!(runtime_checkpoints_with_criu("runc"));
+        assert!(runtime_checkpoints_with_criu("/usr/sbin/crun"));
+        assert!(!runtime_checkpoints_with_criu("runsc"));
+        assert!(!runtime_checkpoints_with_criu("/usr/local/bin/runsc"));
     }
 
     #[tokio::test]

@@ -154,6 +154,7 @@ impl SandboxBackendFactory for FirecrackerSandboxFactory {
 
     fn decode_paused_state(
         &self,
+        _backend: crate::types::SandboxBackendKind,
         artifact_root: PathBuf,
         state: Value,
     ) -> Result<Arc<dyn PausedSandboxState>> {

@@ -3068,23 +3068,21 @@ mod cold_start_backend_tests {
     }
 
     #[test]
-    fn container_defaults_to_delete_on_timeout() {
+    fn container_pauses_on_timeout_like_firecracker() {
         let (backend, action) =
             cold_start_backend(&body(Some(models::SandboxBackend::Container)), BOTH).unwrap();
         assert_eq!(backend, SandboxBackendKind::Container);
-        assert!(matches!(action, SandboxTimeoutAction::Delete));
+        assert!(matches!(action, SandboxTimeoutAction::Pause));
+
+        let mut request = body(Some(models::SandboxBackend::Container));
+        request.auto_pause = Some(true);
+        request.auto_resume = Some(models::SandboxAutoResumeConfig { enabled: true });
+        assert!(cold_start_backend(&request, BOTH).is_ok());
     }
 
     #[test]
     fn container_rejects_capabilities_it_lacks() {
         let cases: Vec<(&str, Box<SetField>)> = vec![
-            ("autoPause", Box::new(|b| b.auto_pause = Some(true))),
-            (
-                "autoResume",
-                Box::new(|b| {
-                    b.auto_resume = Some(models::SandboxAutoResumeConfig { enabled: true })
-                }),
-            ),
             (
                 "extraBootArgs",
                 Box::new(|b| b.extra_boot_args = Some("x=1".to_string())),
@@ -3109,9 +3107,8 @@ mod cold_start_backend_tests {
             );
         }
 
-        // Explicitly empty or disabled values request nothing.
+        // Explicitly empty values request nothing.
         let mut request = body(Some(models::SandboxBackend::Container));
-        request.auto_pause = Some(false);
         request.extra_boot_args = Some("  ".to_string());
         assert!(cold_start_backend(&request, BOTH).is_ok());
 

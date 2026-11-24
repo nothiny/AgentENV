@@ -94,11 +94,12 @@ impl SandboxBackendFactory for BackendRegistry {
 
     fn decode_paused_state(
         &self,
+        backend: SandboxBackendKind,
         artifact_root: PathBuf,
         state: Value,
     ) -> Result<Arc<dyn PausedSandboxState>> {
-        self.factory(SandboxBackendKind::Firecracker)?
-            .decode_paused_state(artifact_root, state)
+        self.factory(backend)?
+            .decode_paused_state(backend, artifact_root, state)
     }
 
     fn restores_paused(&self, backend: SandboxBackendKind) -> bool {
@@ -111,7 +112,7 @@ impl SandboxBackendFactory for BackendRegistry {
         state: &dyn PausedSandboxState,
         envd_access_token: Option<EnvdAccessToken>,
     ) -> Result<Box<dyn SandboxBackend>> {
-        self.factory(SandboxBackendKind::Firecracker)?
+        self.factory(state.backend())?
             .build_from_paused_state(sandbox_id, state, envd_access_token)
     }
 }
@@ -153,6 +154,45 @@ mod tests {
             .to_string()
     }
 
+    #[derive(Debug)]
+    struct ContainerState;
+
+    impl PausedSandboxState for ContainerState {
+        fn encode(&self) -> Result<Value> {
+            Ok(Value::Null)
+        }
+
+        fn runtime_artifacts(&self) -> crate::types::RuntimeArtifactSet {
+            crate::types::RuntimeArtifactSet::empty()
+        }
+
+        fn backend(&self) -> SandboxBackendKind {
+            SandboxBackendKind::Container
+        }
+    }
+
+    #[test]
+    fn routes_paused_state_to_the_backend_that_paused() {
+        let firecracker_only = BackendRegistry::firecracker(MockBackendFactory::new());
+        let container_only =
+            BackendRegistry::new().with(SandboxBackendKind::Container, MockBackendFactory::new());
+        let decode = |registry: &BackendRegistry, backend| {
+            registry.decode_paused_state(backend, PathBuf::from("/nonexistent"), Value::Null)
+        };
+        assert!(decode(&container_only, SandboxBackendKind::Container).is_ok());
+        assert!(decode(&container_only, SandboxBackendKind::Firecracker).is_err());
+        assert!(decode(&firecracker_only, SandboxBackendKind::Container).is_err());
+
+        let resume = |registry: &BackendRegistry| {
+            registry.build_from_paused_state(SandboxId::new(), &ContainerState, None)
+        };
+        assert!(resume(&container_only).is_ok());
+        let err = resume(&firecracker_only)
+            .err()
+            .expect("no container factory");
+        assert!(err.to_string().contains("container"), "{err}");
+    }
+
     #[test]
     fn routes_each_build_to_its_backend() {
         let registry = BackendRegistry::firecracker(named("fc"))
@@ -169,7 +209,7 @@ mod tests {
         let container_only =
             BackendRegistry::new().with(SandboxBackendKind::Container, named("ct"));
         assert!(!container_only.restores_paused(SandboxBackendKind::Firecracker));
-        assert!(!container_only.restores_paused(SandboxBackendKind::Container));
+        assert!(container_only.restores_paused(SandboxBackendKind::Container));
     }
 
     #[test]

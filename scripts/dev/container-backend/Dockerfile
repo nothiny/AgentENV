@@ -7,6 +7,7 @@ RUN apt-get update \
       runc crun iptables iproute2 e2fsprogs util-linux kmod jq busybox-static \
       uidmap strace psmisc curl ca-certificates \
       nodejs npm default-jre-headless umoci zstd \
+      criu libcriu2 \
  && rm -rf /var/lib/apt/lists/*
 # Go toolchain for services/ (gateway, scheduler) and the exact code
 # generators upstream used for services/api/proto.

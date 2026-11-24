@@ -2,8 +2,9 @@
 //!
 //! `AENV_FAILPOINTS` lists the points to trigger, comma-separated. `name`
 //! makes [`fail`] return an error at that point, `name:key` only for that
-//! key (for example a drive ID), and `name=ms` makes [`delay`] sleep. Release
-//! builds compile every point to a no-op.
+//! key (for example a drive ID), `name*n` only the first `n` times the point
+//! is reached, and `name=ms` makes [`delay`] sleep. Release builds compile
+//! every point to a no-op.
 
 /// Errors when `AENV_FAILPOINTS` arms `name`, or `name:key` for this `key`.
 pub(crate) fn fail(name: &str, key: Option<&str>) -> anyhow::Result<()> {
@@ -38,8 +39,25 @@ fn entries(spec: &str) -> impl Iterator<Item = &str> {
 }
 
 #[cfg(debug_assertions)]
+static HITS: std::sync::Mutex<Option<std::collections::HashMap<String, u32>>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(debug_assertions)]
 fn armed(name: &str, key: Option<&str>) -> bool {
-    armed_in(&spec(), name, key)
+    let spec = spec();
+    if armed_in(&spec, name, key) {
+        return true;
+    }
+    let Some(times) = times_in(&spec, name) else {
+        return false;
+    };
+    let mut hits = HITS.lock().unwrap();
+    let count = hits
+        .get_or_insert_with(Default::default)
+        .entry(name.to_owned())
+        .or_default();
+    *count += 1;
+    *count <= times
 }
 
 #[cfg(debug_assertions)]
@@ -47,6 +65,15 @@ fn armed_in(spec: &str, name: &str, key: Option<&str>) -> bool {
     entries(spec).any(|entry| match entry.split_once(':') {
         Some((point, wanted)) => point == name && key == Some(wanted),
         None => entry == name,
+    })
+}
+
+/// `n` for a `name*n` entry.
+#[cfg(debug_assertions)]
+fn times_in(spec: &str, name: &str) -> Option<u32> {
+    entries(spec).find_map(|entry| {
+        let (point, times) = entry.split_once('*')?;
+        (point == name).then(|| times.parse().ok()).flatten()
     })
 }
 
@@ -79,5 +106,13 @@ mod tests {
         assert_eq!(delay_ms_in(spec, "publish"), Some(250));
         assert_eq!(delay_ms_in(spec, "restack"), None);
         assert!(!armed_in("", "restack", None));
+    }
+
+    #[test]
+    fn counted_points_are_not_always_armed() {
+        let spec = "persist*1";
+        assert!(!armed_in(spec, "persist", None));
+        assert_eq!(times_in(spec, "persist"), Some(1));
+        assert_eq!(times_in(spec, "other"), None);
     }
 }

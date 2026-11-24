@@ -47,7 +47,7 @@ fi
 fn inittab(envd_port: u16) -> String {
     format!(
         "::sysinit:/agentenv/bin/busybox sh /.aenv-init\n\
-         ::respawn:/agentenv/envd -isnotfc -port {envd_port}\n"
+         ::respawn:/agentenv/bin/busybox env GODEBUG=multipathtcp=0 /agentenv/envd -isnotfc -port {envd_port}\n"
     )
 }
 
@@ -191,6 +191,18 @@ pub(super) struct BundleSpec<'a> {
     pub envd_port: u16,
     pub cgroups_path: &'a str,
     pub drives: &'a [DriveBind],
+    /// Whether the bundle is for restoring a CRIU dump rather than a start.
+    pub restore: bool,
+}
+
+/// CRIU options file a restore bundle names through the `org.criu.config`
+/// annotation. Connections saved by the dump come back closed, and the
+/// processes go into this container's cgroup rather than the one recorded
+/// in the dump.
+pub(super) const CRIU_CONFIG: &str = "criu.conf";
+
+fn criu_config(cgroups_path: &str) -> String {
+    format!("tcp-close\ncgroup-root {cgroups_path}\n")
 }
 
 /// Writes `init.sh`, the /etc files and `config.json` into the work directory.
@@ -215,6 +227,10 @@ pub(super) fn write_bundle(spec: &BundleSpec<'_>) -> Result<()> {
     .context("write hosts")?;
     fs::write(dir.join("etc/hostname"), format!("{}\n", spec.hostname))
         .context("write hostname")?;
+    if spec.restore {
+        fs::write(dir.join(CRIU_CONFIG), criu_config(spec.cgroups_path))
+            .context("write CRIU config")?;
+    }
     let config = serde_json::to_vec_pretty(&oci_config(spec)).context("encode config.json")?;
     fs::write(dir.join("config.json"), config).context("write config.json")
 }
@@ -313,6 +329,9 @@ pub(super) fn oci_config(spec: &BundleSpec<'_>) -> Value {
         .as_array_mut()
         .expect("mounts is an array")
         .extend(drive_mounts);
+    if spec.restore {
+        config["annotations"] = json!({"org.criu.config": dir.join(CRIU_CONFIG)});
+    }
     config
 }
 
@@ -337,6 +356,7 @@ mod tests {
             envd_port: 49983,
             cgroups_path: "/aenv-container/aenv-x",
             drives: DRIVES,
+            restore: false,
         }
     }
 
@@ -425,7 +445,7 @@ mod tests {
         assert!(fs::read_to_string(temp.path().join("init.sh"))?.contains("/etc/passwd"));
         let inittab = fs::read_to_string(temp.path().join("inittab"))?;
         assert!(inittab.contains("::sysinit:/agentenv/bin/busybox sh /.aenv-init"));
-        assert!(inittab.contains("::respawn:/agentenv/envd -isnotfc -port 49983"));
+        assert!(inittab.contains("/agentenv/envd -isnotfc -port 49983"));
         assert_eq!(
             fs::read_to_string(temp.path().join("etc/resolv.conf"))?,
             "nameserver 10.0.0.53\n"
@@ -435,6 +455,27 @@ mod tests {
         );
         let config: Value = serde_json::from_slice(&fs::read(temp.path().join("config.json"))?)?;
         assert_eq!(config["hostname"], "instance");
+        assert!(config.get("annotations").is_none());
+        assert!(!temp.path().join(CRIU_CONFIG).exists());
+        Ok(())
+    }
+
+    #[test]
+    fn a_restore_bundle_names_its_criu_options() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        write_bundle(&BundleSpec {
+            restore: true,
+            ..spec(temp.path())
+        })?;
+        assert_eq!(
+            fs::read_to_string(temp.path().join(CRIU_CONFIG))?,
+            "tcp-close\ncgroup-root /aenv-container/aenv-x\n"
+        );
+        let config: Value = serde_json::from_slice(&fs::read(temp.path().join("config.json"))?)?;
+        assert_eq!(
+            config["annotations"]["org.criu.config"],
+            temp.path().join(CRIU_CONFIG).display().to_string()
+        );
         Ok(())
     }
 }

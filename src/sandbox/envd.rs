@@ -115,6 +115,21 @@ impl EnvdInstance {
         timeout: Duration,
         retry_interval: Duration,
     ) -> Result<()> {
+        self.wait_for_ready_probing(timeout, retry_interval, HEALTH_PROBE_TIMEOUT)
+            .await
+    }
+
+    /// Like [`wait_for_ready`][Self::wait_for_ready], but the first probe
+    /// gives up after `first_probe_timeout` and each later one waits twice as
+    /// long, up to the usual probe timeout. A probe whose SYN was dropped is
+    /// then retried with a new connection instead of waiting a second for
+    /// the kernel to retransmit it.
+    pub(crate) async fn wait_for_ready_probing(
+        &self,
+        timeout: Duration,
+        retry_interval: Duration,
+        first_probe_timeout: Duration,
+    ) -> Result<()> {
         debug!(
             base_path = %self.config.base_path,
             timeout_ms = timeout.as_millis(),
@@ -122,6 +137,7 @@ impl EnvdInstance {
             "waiting for envd"
         );
         let start = std::time::Instant::now();
+        let mut next_probe_timeout = first_probe_timeout.min(HEALTH_PROBE_TIMEOUT);
 
         loop {
             let elapsed = start.elapsed();
@@ -130,7 +146,8 @@ impl EnvdInstance {
             }
 
             let remaining = timeout - elapsed;
-            let probe_timeout = std::cmp::min(HEALTH_PROBE_TIMEOUT, remaining);
+            let probe_timeout = std::cmp::min(next_probe_timeout, remaining);
+            next_probe_timeout = (next_probe_timeout * 2).min(HEALTH_PROBE_TIMEOUT);
             match tokio::time::timeout(probe_timeout, default_api::health_get(&self.config)).await {
                 Ok(Ok(_)) => {
                     debug!(base_path = %self.config.base_path, "envd started successfully");

@@ -44,7 +44,7 @@ impl PersistedPausedRecord {
         ensure_supported_version(self.version)?;
 
         let paused_state = factory
-            .decode_paused_state(self.artifact_root, self.state)
+            .decode_paused_state(self.metadata.backend, self.artifact_root, self.state)
             .map_err(|source| SandboxPersistenceError::InvalidRecord {
                 reason: "failed to decode paused sandbox state".to_string(),
                 source: Some(source),
@@ -375,7 +375,13 @@ impl SandboxPersister for FileBackedSandboxPersister {
             artifact_root: artifact_root.to_path_buf(),
             state,
         };
-        let result = self.put_record(&record).await;
+        let result = match crate::sandbox::failpoint::fail("persist-paused-record", None) {
+            Ok(()) => self.put_record(&record).await,
+            Err(source) => Err(SandboxPersistenceError::InvalidRecord {
+                reason: "failed to write paused sandbox record".to_string(),
+                source: Some(source),
+            }),
+        };
         if result.is_err() {
             let _ = Self::remove_artifact_root(artifact_root).await;
         }
@@ -467,6 +473,7 @@ mod tests {
 
         fn decode_paused_state(
             &self,
+            _backend: crate::types::SandboxBackendKind,
             _artifact_root: PathBuf,
             _state: Value,
         ) -> Result<Arc<dyn PausedSandboxState>> {

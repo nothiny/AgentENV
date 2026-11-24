@@ -94,6 +94,9 @@ fn canonicalized_runtime_owned_roots() -> &'static [PathBuf] {
             [
                 managed_snapshot_base(),
                 config.orchestrator.persisted_sandbox_store_path.clone(),
+                // Container sealed layers go away at a server restart, so a
+                // pause must adopt them into its own artifacts.
+                crate::sandbox::container::sealed_layers_base(config),
             ]
             .into_iter()
             .map(|root| fs::canonicalize(&root).unwrap_or(root))
@@ -334,7 +337,7 @@ async fn rewrite_live_runtime_config_for_restack(
     Ok(())
 }
 
-pub(super) async fn stage_overlaybd_snapshot_from_live_runtime(
+pub(crate) async fn stage_overlaybd_snapshot_from_live_runtime(
     live_runtime_image_config_path: &Path,
     output_dir: &Path,
     snapshot_layer_path: Option<&Path>,

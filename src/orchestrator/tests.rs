@@ -6407,15 +6407,13 @@ async fn sandbox_logs_filters_inherited_history_and_does_not_hold_runtime_lock()
 // ---- backend capabilities ---------------------------------------------------
 
 /// A running sandbox relabelled as a container sandbox, plus a mock behavior
-/// that fails the test if any VM-state operation reaches the backend.
+/// that fails the test if a memory snapshot reaches the backend.
 async fn running_container_sandbox() -> Result<(Arc<TestOrchestrator>, SandboxMetadata)> {
     let behavior = Arc::new(MockBehavior::new());
-    for operation in [MockOperation::Pause, MockOperation::Snapshot] {
-        behavior.set_on_operation(
-            operation,
-            Arc::new(move || panic!("{operation:?} reached a container sandbox")),
-        );
-    }
+    behavior.set_on_operation(
+        MockOperation::Snapshot,
+        Arc::new(|| panic!("a memory snapshot reached a container sandbox")),
+    );
     let orchestrator = make_orchestrator_without_background_with_factory(
         InMemoryMetadataStore::new(),
         MockBackendFactory::with_behavior(behavior),
@@ -6457,10 +6455,6 @@ async fn container_sandboxes_reject_unsupported_operations_without_side_effects(
     let id = sandbox.id;
 
     assert_unsupported(
-        orchestrator.pause_sandbox(id).await.unwrap_err(),
-        BackendCapability::Pause,
-    );
-    assert_unsupported(
         orchestrator.capture_snapshot(id).await.unwrap_err(),
         BackendCapability::Snapshot,
     );
@@ -6472,7 +6466,7 @@ async fn container_sandboxes_reject_unsupported_operations_without_side_effects(
         BackendCapability::CustomExtension,
     );
     assert!(orchestrator
-        .pause_sandbox(id)
+        .capture_snapshot(id)
         .await
         .unwrap_err()
         .is_backend_rejection());
@@ -6526,7 +6520,7 @@ fn assert_unsupported_on(
 }
 
 #[tokio::test]
-async fn expired_container_sandbox_is_deleted_even_with_a_pause_action() -> Result<()> {
+async fn expired_container_sandbox_with_a_pause_action_is_paused() -> Result<()> {
     setup();
     let (orchestrator, sandbox) = running_container_sandbox().await?;
     assert!(matches!(
@@ -6544,12 +6538,16 @@ async fn expired_container_sandbox_is_deleted_even_with_a_pause_action() -> Resu
         orchestrator.evict_expired_sandboxes().await?,
         vec![sandbox.id]
     );
-    assert!(orchestrator.get_sandbox(&sandbox.id).await?.is_none());
+    let paused = orchestrator
+        .get_sandbox(&sandbox.id)
+        .await?
+        .expect("a paused container sandbox is kept");
+    assert_eq!(paused.state, SandboxState::Paused);
     Ok(())
 }
 
 #[tokio::test]
-async fn shutdown_deletes_container_sandboxes_and_pauses_firecracker_ones() -> Result<()> {
+async fn shutdown_pauses_container_and_firecracker_sandboxes() -> Result<()> {
     setup();
     let persister = RecordingPersister::default();
     let orchestrator = make_orchestrator_without_background_with_factory_and_persister(
@@ -6567,20 +6565,52 @@ async fn shutdown_deletes_container_sandboxes_and_pauses_firecracker_ones() -> R
 
     orchestrator.shutdown().await?;
 
-    assert!(orchestrator.get_sandbox(&container.id).await?.is_none());
-    let paused = orchestrator
-        .get_sandbox(&firecracker.id)
-        .await?
-        .expect("firecracker sandbox survives shutdown");
-    assert_eq!(paused.state, SandboxState::Paused);
+    for id in [firecracker.id, container.id] {
+        let paused = orchestrator
+            .get_sandbox(&id)
+            .await?
+            .expect("sandbox survives shutdown");
+        assert_eq!(paused.state, SandboxState::Paused);
+    }
     let calls = persister.calls();
     assert_eq!(
         calls
             .iter()
             .filter(|call| matches!(call, RecordingCall::PersistPaused))
             .count(),
-        1,
-        "only the firecracker sandbox is paused: {calls:?}"
+        2,
+        "both sandboxes are paused: {calls:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn shutdown_deletes_a_container_sandbox_it_cannot_pause() -> Result<()> {
+    setup();
+    let behavior = Arc::new(MockBehavior::new());
+    for _ in 0..3 {
+        behavior.push_action(
+            MockOperation::Pause,
+            MockAction::Fail {
+                message: "dump refused".to_owned(),
+            },
+        );
+    }
+    let orchestrator = make_orchestrator_without_background_with_factory_and_persister(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::with_behavior(behavior),
+        RecordingPersister::default(),
+    );
+    let container = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?;
+    relabel_as_container(&orchestrator.store, container.id).await?;
+
+    orchestrator.shutdown().await?;
+
+    assert!(
+        orchestrator.get_sandbox(&container.id).await?.is_none(),
+        "the container sandbox is deleted, not left running"
     );
     Ok(())
 }

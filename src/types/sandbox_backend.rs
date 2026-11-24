@@ -1,5 +1,6 @@
 use std::fmt;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::{Deserialize, Serialize};
 
@@ -47,6 +48,18 @@ pub enum BackendCapability {
     CustomExtension,
 }
 
+/// Whether this node's container runtime can pause: set once at startup from
+/// the configured OCI runtime and the presence of CRIU (see
+/// [`set_container_pause_available`]). Assumed available until then.
+static CONTAINER_PAUSE: AtomicBool = AtomicBool::new(true);
+
+/// Records whether container sandboxes can pause on this node. Every pause
+/// decision (create, timeout, shutdown, loading paused records) goes through
+/// [`SandboxBackendKind::supports`], which reads this.
+pub fn set_container_pause_available(available: bool) {
+    CONTAINER_PAUSE.store(available, Ordering::Relaxed);
+}
+
 impl SandboxBackendKind {
     pub const ALL: [Self; 2] = [Self::Firecracker, Self::Container];
 
@@ -67,6 +80,9 @@ impl SandboxBackendKind {
                 BackendCapability::RootfsImage | BackendCapability::FilesystemFork
             ),
             Self::Container => match capability {
+                // Pause dumps the processes with CRIU and releases every
+                // runtime resource, which needs runc or crun and CRIU.
+                BackendCapability::Pause => CONTAINER_PAUSE.load(Ordering::Relaxed),
                 // The slot's egress rules match the container's veth, which
                 // keeps the name tap0; drives are mounted on the host and
                 // bound into the container.
@@ -76,8 +92,7 @@ impl SandboxBackendKind {
                 | BackendCapability::AttachedDrives
                 | BackendCapability::RootfsImage
                 | BackendCapability::FilesystemFork => true,
-                BackendCapability::Pause
-                | BackendCapability::Fork
+                BackendCapability::Fork
                 | BackendCapability::Snapshot
                 | BackendCapability::SnapshotRestore
                 | BackendCapability::ExtraBootArgs
@@ -206,6 +221,7 @@ mod tests {
         assert_eq!(
             container,
             vec![
+                Pause,
                 RootfsImage,
                 FilesystemFork,
                 ManagedVolumes,

@@ -2684,9 +2684,12 @@ where
             debug!("skipping runtime proxy route publication because sandbox handle is stale");
         }
 
-        if matches!(plan, LaunchPlan::Resume(_)) {
-            if let Err(err) = self.persister.delete_record(&sandbox_id).await {
-                warn!(error = %format_args!("{err:#}"), "failed to delete persisted sandbox record after resume");
+        if let LaunchPlan::Resume(resume) = &plan {
+            match self.persister.delete_record(&sandbox_id).await {
+                Ok(()) => resume.paused_state.release_after_resume(),
+                Err(err) => {
+                    warn!(error = %format_args!("{err:#}"), "failed to delete persisted sandbox record after resume");
+                }
             }
         }
 
@@ -2948,7 +2951,30 @@ where
                         {
                             self.delete_sandbox_inner(sandbox_id).await
                         } else {
-                            self.pause_sandbox_inner(sandbox_id).await
+                            match self.pause_sandbox_inner(sandbox_id).await {
+                                // A container left running does not survive
+                                // the restart either, and its mounts would
+                                // hold the ublk daemon: delete it once the
+                                // last pause attempt fails.
+                                Err(err)
+                                    if pass == MAX_SHUTDOWN_PASSES
+                                        && metadata.backend == SandboxBackendKind::Container =>
+                                {
+                                    warn!(
+                                        sandbox_id = %sandbox_id,
+                                        error = %err,
+                                        "deleting container sandbox that could not be paused for shutdown"
+                                    );
+                                    self.delete_sandbox_inner(sandbox_id).await.map_err(
+                                        |delete_err| {
+                                            OrchestratorError::InternalError(format!(
+                                                "{err}; delete after failed pause: {delete_err}"
+                                            ))
+                                        },
+                                    )
+                                }
+                                other => other,
+                            }
                         };
                         if let Err(err) = result {
                             last_failures.push(format!("{sandbox_id}: {err}"));

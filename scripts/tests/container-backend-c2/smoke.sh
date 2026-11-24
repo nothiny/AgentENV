@@ -78,7 +78,7 @@ if [ "$STATUS" = 201 ]; then pass "container cold create (${ELAPSED_MS} ms incl.
 check "create reports backend container" test "$(jq -r .backend <<<"$BODY_OUT")" = container
 call GET "/sandboxes/$ID"
 check "detail: backend container" test "$(jq -r .backend <<<"$BODY_OUT")" = container
-check "detail: omitted autoPause kills on timeout" test "$(jq -r .lifecycle.onTimeout <<<"$BODY_OUT")" = kill
+check "detail: omitted autoPause pauses on timeout" test "$(jq -r .lifecycle.onTimeout <<<"$BODY_OUT")" = pause
 check "one runtime container" test "$(runtime_containers)" = 1
 UBLK_RUNNING=$(ls /dev/ublkb* 2>/dev/null | wc -l)
 
@@ -102,11 +102,11 @@ rm -f /tmp/c2-download.bin
 check "upload/download round trip (1 MiB)" cmp -s /tmp/c2-upload.bin /tmp/c2-download.bin
 
 # --- unsupported operations leave the sandbox running -------------------------
-call POST "/sandboxes/$ID/pause"
-check "pause rejected with 400 unsupported_capability" \
+call POST "/sandboxes/$ID/snapshots" '{}'
+check "memory snapshot rejected with 400 unsupported_capability" \
     test "$STATUS/$(jq -r .reason <<<"$BODY_OUT")" = "400/unsupported_capability"
 OUT=$("$AENV" exec "$ID" -- echo still-running 2>&1)
-check "sandbox still serves exec after rejected pause" grep -qx still-running <<<"$OUT"
+check "sandbox still serves exec after rejected snapshot" grep -qx still-running <<<"$OUT"
 
 # --- delete ------------------------------------------------------------------
 call DELETE "/sandboxes/$ID"
@@ -116,7 +116,8 @@ check "delete releases container, mounts and work dir" nothing_left
 check "delete releases the rootfs device" test "$(ls /dev/ublkb* 2>/dev/null | wc -l)" = "$((UBLK_RUNNING - 1))"
 
 # --- TTL expiry deletes ------------------------------------------------------
-create ',"timeout":3'
+# Expiry pauses by default (see container-backend-pause); autoPause false deletes.
+create ',"timeout":3,"autoPause":false'
 check "short-lived create" test "$STATUS" = 201
 for _ in $(seq 1 30); do call GET "/sandboxes/$ID"; [ "$STATUS" = 404 ] && break; sleep 1; done
 check "expired container sandbox is deleted" test "$STATUS" = 404
