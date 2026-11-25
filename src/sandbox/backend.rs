@@ -96,6 +96,74 @@ impl From<anyhow::Error> for SandboxCaptureError {
 pub type SandboxCaptureResult<T> = std::result::Result<T, SandboxCaptureError>;
 pub type SandboxForkResult = anyhow::Result<Box<dyn SandboxBackend>>;
 
+/// Marks a fork child's error when the child failed and stopping it failed
+/// too, so it may still hold devices and mounts on its volumes. Whoever made
+/// those volumes for it must not release or delete them yet.
+///
+/// When the failure happened inside the backend, the marker carries the
+/// child so the caller can retry the teardown ([`take_child`][Self::take_child]).
+pub struct UnstoppedForkChild {
+    child: std::sync::Mutex<Option<Box<dyn SandboxBackend>>>,
+    stop_error: String,
+}
+
+impl UnstoppedForkChild {
+    /// `failure`, marked as left behind by `child`, whose `stop` failed.
+    pub fn error(
+        failure: anyhow::Error,
+        child: Option<Box<dyn SandboxBackend>>,
+        stop_error: &anyhow::Error,
+    ) -> anyhow::Error {
+        failure.context(Self {
+            child: std::sync::Mutex::new(child),
+            stop_error: format!("{stop_error:#}"),
+        })
+    }
+
+    /// Whether `error` is a fork child's that was not torn down.
+    pub fn marks(error: &anyhow::Error) -> bool {
+        error.downcast_ref::<Self>().is_some()
+    }
+
+    /// The child left behind, once.
+    pub fn take_child(error: &anyhow::Error) -> Option<Box<dyn SandboxBackend>> {
+        error
+            .downcast_ref::<Self>()
+            .and_then(|marker| marker.child.lock().unwrap().take())
+    }
+}
+
+impl fmt::Display for UnstoppedForkChild {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "fork child failed and was not torn down ({}); its teardown is retried",
+            self.stop_error
+        )
+    }
+}
+
+impl fmt::Debug for UnstoppedForkChild {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("UnstoppedForkChild")
+            .field("stop_error", &self.stop_error)
+            .finish_non_exhaustive()
+    }
+}
+
+/// One capture of a running sandbox, from which full-fork children start.
+///
+/// The capture keeps what its children restore from (the process dump and
+/// the sealed layers) until it is dropped, so it can start any number of
+/// children, at once or one after another.
+#[async_trait]
+pub trait SandboxForkCapture: Send + Sync {
+    /// Start one child per `spec` entry and return one result per entry, in
+    /// the same order. A child that fails is stopped before its error is
+    /// returned; its siblings are unaffected.
+    async fn spawn(&self, spec: &[SandboxForkSpec]) -> Vec<SandboxForkResult>;
+}
+
 #[derive(Clone, Debug)]
 pub struct SandboxForkSpec {
     pub sandbox_id: SandboxId,
@@ -298,6 +366,27 @@ pub trait SandboxBackend: Send + 'static {
         &mut self,
         spec: &[SandboxForkSpec],
     ) -> SandboxCaptureResult<Vec<SandboxForkResult>>;
+
+    /// Whether this sandbox can be forked in `mode`, checked before anything
+    /// is frozen or captured. The error says why not; the caller reports it
+    /// to the client.
+    fn check_fork(&self, _mode: crate::types::SandboxForkMode) -> Result<()> {
+        Ok(())
+    }
+
+    /// Capture this running sandbox once for a full fork whose children are
+    /// described only afterwards, so that their volumes can be cloned from
+    /// what this capture sealed: memory, root filesystem and volumes all come
+    /// from one frozen window. The source keeps running when this returns.
+    ///
+    /// Errors follow [`fork`][Self::fork]: recoverable ones leave the source
+    /// running, terminal ones mean it must be torn down. Backends that fork
+    /// in one step through [`fork`][Self::fork] return a recoverable error.
+    async fn capture_fork(&mut self) -> SandboxCaptureResult<Box<dyn SandboxForkCapture>> {
+        Err(SandboxCaptureError::recoverable(anyhow::anyhow!(
+            "this backend cannot capture a fork ahead of its children"
+        )))
+    }
 
     /// Capture the guest into `at` and describe what was written.
     ///

@@ -52,6 +52,11 @@ pub(super) struct ContainerPausedState {
     pub network: Option<SandboxNetworkPolicy>,
     pub custom_extension_params: Option<CustomExtensionParams>,
     pub envd_port: u16,
+    /// Whether the dumped container had the auth directory bound in. CRIU
+    /// restores exactly the mounts it dumped, so the restore binds it only
+    /// then. Absent from containers paused before it existed.
+    #[serde(default)]
+    pub auth_mount: bool,
 }
 
 impl ContainerPausedState {
@@ -121,7 +126,9 @@ impl PausedSandboxState for ContainerPausedState {
     }
 
     /// The restored processes no longer need their dump; the sealed rootfs
-    /// and drives stay, since the running devices stack on them.
+    /// and drives stay, since the running devices stack on them. A paused
+    /// state has exactly one consumer: fork captures, which many children
+    /// restore from, never come through here.
     fn release_after_resume(&self) {
         match std::fs::remove_dir_all(&self.criu_dir) {
             Ok(()) => {}
@@ -155,6 +162,7 @@ mod tests {
             network: None,
             custom_extension_params: None,
             envd_port: 49983,
+            auth_mount: true,
         }
     }
 
@@ -199,6 +207,16 @@ mod tests {
         state(temp.path()).release_after_resume();
         assert!(!temp.path().join("criu").exists());
         assert!(temp.path().join("rootfs/image.json").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn state_paused_before_the_auth_mount_restores_without_it() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        write_artifacts(temp.path());
+        let mut encoded = state(temp.path()).encode()?;
+        encoded.as_object_mut().unwrap().remove("authMount");
+        assert!(!ContainerPausedState::decode(encoded)?.auth_mount);
         Ok(())
     }
 

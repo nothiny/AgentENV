@@ -48,16 +48,17 @@ pub enum BackendCapability {
     CustomExtension,
 }
 
-/// Whether this node's container runtime can pause: set once at startup from
-/// the configured OCI runtime and the presence of CRIU (see
+/// Whether this node's container runtime can checkpoint with CRIU: set once
+/// at startup from the configured OCI runtime and the presence of CRIU (see
 /// [`set_container_pause_available`]). Assumed available until then.
-static CONTAINER_PAUSE: AtomicBool = AtomicBool::new(true);
+static CONTAINER_CRIU: AtomicBool = AtomicBool::new(true);
 
-/// Records whether container sandboxes can pause on this node. Every pause
-/// decision (create, timeout, shutdown, loading paused records) goes through
+/// Records whether container sandboxes can be dumped with CRIU on this node,
+/// which both pause and full fork need. Every such decision (create,
+/// timeout, shutdown, loading paused records, fork) goes through
 /// [`SandboxBackendKind::supports`], which reads this.
 pub fn set_container_pause_available(available: bool) {
-    CONTAINER_PAUSE.store(available, Ordering::Relaxed);
+    CONTAINER_CRIU.store(available, Ordering::Relaxed);
 }
 
 impl SandboxBackendKind {
@@ -81,8 +82,11 @@ impl SandboxBackendKind {
             ),
             Self::Container => match capability {
                 // Pause dumps the processes with CRIU and releases every
-                // runtime resource, which needs runc or crun and CRIU.
-                BackendCapability::Pause => CONTAINER_PAUSE.load(Ordering::Relaxed),
+                // runtime resource; a full fork restores one dump into every
+                // child. Both need runc or crun and CRIU.
+                BackendCapability::Pause | BackendCapability::Fork => {
+                    CONTAINER_CRIU.load(Ordering::Relaxed)
+                }
                 // The slot's egress rules match the container's veth, which
                 // keeps the name tap0; drives are mounted on the host and
                 // bound into the container.
@@ -92,8 +96,7 @@ impl SandboxBackendKind {
                 | BackendCapability::AttachedDrives
                 | BackendCapability::RootfsImage
                 | BackendCapability::FilesystemFork => true,
-                BackendCapability::Fork
-                | BackendCapability::Snapshot
+                BackendCapability::Snapshot
                 | BackendCapability::SnapshotRestore
                 | BackendCapability::ExtraBootArgs
                 | BackendCapability::CustomExtension => false,
@@ -223,6 +226,7 @@ mod tests {
             vec![
                 Pause,
                 RootfsImage,
+                Fork,
                 FilesystemFork,
                 ManagedVolumes,
                 AttachedDrives,

@@ -11,7 +11,8 @@ release from `config/deps_manifest.toml` when it is missing locally, unless
 
 The build is intentionally self-contained:
 
-1. Clone and compile `envd` from `e2b-dev/infra` at `ENVD_REF`.
+1. Clone `envd` from `e2b-dev/infra` at `ENVD_REF`, apply `patches/` (see
+   `patches/README.md`), and compile it.
 2. Assemble the guest tools rootfs with BusyBox, `/init`, `/agentenv/pivot-init`,
    and `/agentenv/envd`.
 3. Export the tools rootfs as an OCI image with the
@@ -87,7 +88,7 @@ The build accepts these Make variables:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `TOOLS_VERSION` | `0.1.1` | Immutable SemVer release of the complete tools drive |
+| `TOOLS_VERSION` | `0.1.2` | Immutable SemVer release of the complete tools drive |
 | `ENVD_REF` | `2026.17` | Tag, branch, or fetchable commit to build from the envd upstream repository |
 | `ENVD_UPSTREAM_REPO` | `https://github.com/e2b-dev/infra.git` | Repository containing `packages/envd` |
 | `ARCH` | host architecture, normalized to `amd64` or `arm64` | Target architecture |
@@ -98,11 +99,11 @@ The build accepts these Make variables:
 Examples:
 
 ```bash
-make TOOLS_VERSION=0.1.1 ENVD_REF=2026.17 ARCH=amd64
+make TOOLS_VERSION=0.1.2 ENVD_REF=2026.17 ARCH=amd64
 
 make \
   ENVD_UPSTREAM_REPO=https://github.com/e2b-dev/infra.git \
-  TOOLS_VERSION=0.1.1 \
+  TOOLS_VERSION=0.1.2 \
   ENVD_REF=2026.17 \
   ARCH=amd64
 ```
@@ -117,9 +118,9 @@ tags to prevent concurrent or external publishers from replacing a release.
 
 ```bash
 make publish \
-  TOOLS_VERSION=0.1.1 \
+  TOOLS_VERSION=0.1.2 \
   ENVD_REF=2026.17 \
-  IMAGE=ghcr.io/kvcache-ai/agentenv-tools:0.1.1
+  IMAGE=ghcr.io/kvcache-ai/agentenv-tools:0.1.2
 
 make publish \
   TOOLS_VERSION=0.1.1-custom.1 \

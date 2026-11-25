@@ -1,0 +1,84 @@
+--- a/packages/envd/internal/api/init.go
++++ b/packages/envd/internal/api/init.go
+@@ -8,6 +8,7 @@
+ 	"io"
+ 	"net/http"
+ 	"net/netip"
++	"os"
+ 	"os/exec"
+ 	"strings"
+ 	"time"
+@@ -28,6 +29,12 @@
+ 	ErrAccessTokenResetNotAuthorized = errors.New("access token reset not authorized")
+ )
+ 
++// accessTokenHashFile names, outside Firecracker, the SHA-512 (hex) of a
++// token /init may switch to, as the MMDS hash does in a VM. AgentENV binds
++// it read-only into each container and writes it for a fork child, whose
++// restored envd still holds its source's token. Absent or empty: no switch.
++const accessTokenHashFile = "/run/agentenv/access-token-hash"
++
+ const (
+ 	maxTimeInPast   = 50 * time.Millisecond
+ 	maxTimeInFuture = 5 * time.Second
+@@ -59,6 +66,20 @@
+ 	}
+ }
+ 
++// authorizedTokenSwitch reports whether requestToken replaces the token envd
++// holds and accessTokenHashFile authorizes it.
++func (a *API) authorizedTokenSwitch(ctx context.Context, requestToken *SecureToken) bool {
++	if !a.isNotFC || !requestToken.IsSet() {
++		return false
++	}
++	if a.accessToken.IsSet() && a.accessToken.EqualsSecure(requestToken) {
++		return false
++	}
++	matches, _ := a.checkMMDSHash(ctx, requestToken)
++
++	return matches
++}
++
+ // checkMMDSHash checks if the request token matches the MMDS hash.
+ // Returns (matches, mmdsExists).
+ //
+@@ -67,13 +88,19 @@
+ //   - hash(""): explicitly allows nil token (token reset authorized)
+ //   - "": MMDS not properly configured, no authorization granted
+ func (a *API) checkMMDSHash(ctx context.Context, requestToken *SecureToken) (bool, bool) {
++	var mmdsHash string
+ 	if a.isNotFC {
+-		return false, false
+-	}
+-
+-	mmdsHash, err := a.mmdsClient.GetAccessTokenHash(ctx)
+-	if err != nil {
+-		return false, false
++		data, err := os.ReadFile(accessTokenHashFile)
++		if err != nil {
++			return false, false
++		}
++		mmdsHash = strings.TrimSpace(string(data))
++	} else {
++		var err error
++		mmdsHash, err = a.mmdsClient.GetAccessTokenHash(ctx)
++		if err != nil {
++			return false, false
++		}
+ 	}
+ 
+ 	if mmdsHash == "" {
+@@ -132,8 +159,11 @@
+ 		a.initLock.Lock()
+ 		defer a.initLock.Unlock()
+ 
+-		// Update data only if the request is newer or if there's no timestamp at all
+-		if initRequest.Timestamp == nil || a.lastSetTime.SetToGreater(initRequest.Timestamp.UnixNano()) {
++		// Update data only if the request is newer or if there's no timestamp at all.
++		// A token switch authorized by accessTokenHashFile is never stale: a
++		// restored envd keeps the lastSetTime of the process it was dumped from.
++		if initRequest.Timestamp == nil || a.lastSetTime.SetToGreater(initRequest.Timestamp.UnixNano()) ||
++			a.authorizedTokenSwitch(ctx, initRequest.AccessToken) {
+ 			err = a.SetData(ctx, logger, initRequest)
+ 			if err != nil {
+ 				switch {

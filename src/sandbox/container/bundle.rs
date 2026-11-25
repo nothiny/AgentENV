@@ -193,7 +193,23 @@ pub(super) struct BundleSpec<'a> {
     pub drives: &'a [DriveBind],
     /// Whether the bundle is for restoring a CRIU dump rather than a start.
     pub restore: bool,
+    /// Whether to bind [`AUTH_DIR`] read-only at [`AUTH_MOUNT`]. Every new
+    /// container has it; a restore has it when the dumped container did,
+    /// since CRIU restores exactly the mounts it dumped.
+    pub auth: bool,
 }
+
+/// Host directory, in the work directory, that the container sees at
+/// [`AUTH_MOUNT`]: control files only the server writes.
+pub(super) const AUTH_DIR: &str = "auth";
+/// Where the container sees [`AUTH_DIR`].
+pub(super) const AUTH_MOUNT: &str = "/run/agentenv";
+/// The SHA-512 (hex) of the access token envd must accept from its next
+/// `/init` even though it holds another one: a fork child's restored envd
+/// still holds its parent's token. envd built with the tools image's
+/// access-token-file patch reads it, as Firecracker's envd reads the hash
+/// from MMDS.
+pub(super) const ACCESS_TOKEN_HASH: &str = "access-token-hash";
 
 /// CRIU options file a restore bundle names through the `org.criu.config`
 /// annotation. Connections saved by the dump come back closed, and the
@@ -230,6 +246,9 @@ pub(super) fn write_bundle(spec: &BundleSpec<'_>) -> Result<()> {
     if spec.restore {
         fs::write(dir.join(CRIU_CONFIG), criu_config(spec.cgroups_path))
             .context("write CRIU config")?;
+    }
+    if spec.auth {
+        fs::create_dir_all(dir.join(AUTH_DIR)).context("create auth directory")?;
     }
     let config = serde_json::to_vec_pretty(&oci_config(spec)).context("encode config.json")?;
     fs::write(dir.join("config.json"), config).context("write config.json")
@@ -325,10 +344,11 @@ pub(super) fn oci_config(spec: &BundleSpec<'_>) -> Value {
             ]
         }
     });
-    config["mounts"]
-        .as_array_mut()
-        .expect("mounts is an array")
-        .extend(drive_mounts);
+    let mounts = config["mounts"].as_array_mut().expect("mounts is an array");
+    if spec.auth {
+        mounts.push(bind(AUTH_MOUNT, &dir.join(AUTH_DIR), true));
+    }
+    mounts.extend(drive_mounts);
     if spec.restore {
         config["annotations"] = json!({"org.criu.config": dir.join(CRIU_CONFIG)});
     }
@@ -357,10 +377,31 @@ mod tests {
             cgroups_path: "/aenv-container/aenv-x",
             drives: DRIVES,
             restore: false,
+            auth: true,
         }
     }
 
     static DRIVES: &[DriveBind] = &[];
+
+    #[test]
+    fn auth_directory_is_bound_read_only_only_when_asked() {
+        let find = |config: &Value| {
+            config["mounts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|m| m["destination"] == AUTH_MOUNT)
+                .cloned()
+        };
+        let mut spec = spec(Path::new("/work/sb"));
+        let auth = find(&oci_config(&spec)).unwrap();
+        assert_eq!(auth["source"], "/work/sb/auth");
+        assert!(auth["options"].as_array().unwrap().contains(&json!("ro")));
+        // A restore of a container dumped without it must not add it.
+        spec.restore = true;
+        spec.auth = false;
+        assert!(find(&oci_config(&spec)).is_none());
+    }
 
     #[test]
     fn drives_are_bound_after_the_base_mounts() {
@@ -457,6 +498,7 @@ mod tests {
         assert_eq!(config["hostname"], "instance");
         assert!(config.get("annotations").is_none());
         assert!(!temp.path().join(CRIU_CONFIG).exists());
+        assert!(temp.path().join(AUTH_DIR).is_dir());
         Ok(())
     }
 

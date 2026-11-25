@@ -6652,3 +6652,221 @@ async fn create_rejects_a_backend_the_node_does_not_run() -> Result<()> {
     assert!(orchestrator.list_sandboxes().await?.is_empty());
     Ok(())
 }
+
+/// Records what a container full fork asks of its preparer.
+struct RecordingPreparer {
+    events: Arc<StdMutex<Vec<String>>>,
+    count: usize,
+    fail: bool,
+}
+
+#[async_trait]
+impl ForkChildPreparer for RecordingPreparer {
+    fn count(&self) -> usize {
+        self.count
+    }
+
+    async fn prepare(
+        &mut self,
+        _source: &SandboxMetadata,
+    ) -> anyhow::Result<Vec<SandboxForkChildSpec>> {
+        self.events.lock().unwrap().push("prepare".to_owned());
+        if self.fail {
+            anyhow::bail!("no volumes for you");
+        }
+        Ok((0..self.count)
+            .map(|_| SandboxForkChildSpec {
+                sandbox_id: SandboxId::new(),
+                ..Default::default()
+            })
+            .collect())
+    }
+
+    async fn release(&mut self, children: &[SandboxId]) {
+        self.events
+            .lock()
+            .unwrap()
+            .push(format!("release {}", children.len()));
+    }
+}
+
+async fn container_fork_fixture() -> Result<(
+    Arc<TestOrchestrator>,
+    SandboxMetadata,
+    Arc<MockBehavior>,
+    Arc<StdMutex<Vec<String>>>,
+)> {
+    let behavior = Arc::new(MockBehavior::new());
+    let events = Arc::new(StdMutex::new(Vec::new()));
+    let recorded = Arc::clone(&events);
+    behavior.set_on_operation(
+        MockOperation::CaptureFork,
+        Arc::new(move || recorded.lock().unwrap().push("capture".to_owned())),
+    );
+    behavior.set_on_operation(
+        MockOperation::Fork,
+        Arc::new(|| panic!("a container full fork must capture ahead of its children")),
+    );
+    let orchestrator = make_orchestrator_without_background_with_factory(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::with_behavior(Arc::clone(&behavior)),
+    );
+    let mut request = create_request(Some(60), &[]);
+    request.secure = true;
+    let created = orchestrator.create_sandbox(request).await?;
+    relabel_as_container(&orchestrator.store, created.id).await?;
+    let source = orchestrator
+        .get_sandbox(&created.id)
+        .await?
+        .expect("created sandbox");
+    Ok((orchestrator, source, behavior, events))
+}
+
+#[tokio::test]
+async fn container_full_fork_prepares_children_after_the_capture() -> Result<()> {
+    setup();
+    let (orchestrator, source, behavior, events) = container_fork_fixture().await?;
+    behavior.push_action(
+        MockOperation::ForkChild,
+        MockAction::Fail {
+            message: "restore failed".to_owned(),
+        },
+    );
+
+    let outcomes = orchestrator
+        .fork_sandbox_with_specs(
+            source.id,
+            ForkChildren::AfterCapture(Box::new(RecordingPreparer {
+                events: Arc::clone(&events),
+                count: 3,
+                fail: false,
+            })),
+            NewTimeout::UseExisting,
+            SandboxForkMode::Full,
+        )
+        .await?;
+
+    // Captured once, then described, and the child that failed released.
+    assert_eq!(
+        *events.lock().unwrap(),
+        vec!["capture", "prepare", "release 1"]
+    );
+    assert_eq!(outcomes.len(), 3);
+    assert!(outcomes[0].is_err());
+    let children: Vec<_> = outcomes[1..]
+        .iter()
+        .map(|outcome| outcome.as_ref().expect("restored child").clone())
+        .collect();
+    let source_token = orchestrator.get_envd_access_token(&source);
+    for child in &children {
+        assert_eq!(child.state, SandboxState::Running);
+        assert_eq!(child.backend, SandboxBackendKind::Container);
+        assert!(child.secure);
+        assert_ne!(orchestrator.get_envd_access_token(child), source_token);
+        assert_proxy_ready(&orchestrator, &child.id).await?;
+    }
+    let source_after = orchestrator.get_sandbox(&source.id).await?.expect("source");
+    assert_eq!(source_after.state, SandboxState::Running);
+    Ok(())
+}
+
+#[tokio::test]
+async fn container_full_fork_that_cannot_prepare_leaves_the_source_running() -> Result<()> {
+    setup();
+    let (orchestrator, source, _behavior, events) = container_fork_fixture().await?;
+    let err = orchestrator
+        .fork_sandbox_with_specs(
+            source.id,
+            ForkChildren::AfterCapture(Box::new(RecordingPreparer {
+                events: Arc::clone(&events),
+                count: 2,
+                fail: true,
+            })),
+            NewTimeout::UseExisting,
+            SandboxForkMode::Full,
+        )
+        .await
+        .unwrap_err();
+    assert!(format!("{err:#}").contains("no volumes for you"), "{err:#}");
+    // A failed preparation keeps nothing reserved, so nothing is released.
+    assert_eq!(*events.lock().unwrap(), vec!["capture", "prepare"]);
+    let source_after = orchestrator.get_sandbox(&source.id).await?.expect("source");
+    assert_eq!(source_after.state, SandboxState::Running);
+    assert_eq!(orchestrator.list_sandboxes().await?.len(), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn container_full_fork_capture_failure_skips_the_children() -> Result<()> {
+    setup();
+    let (orchestrator, source, behavior, events) = container_fork_fixture().await?;
+    behavior.push_action(
+        MockOperation::CaptureFork,
+        MockAction::Fail {
+            message: "criu dump failed".to_owned(),
+        },
+    );
+    orchestrator
+        .fork_sandbox_with_specs(
+            source.id,
+            ForkChildren::AfterCapture(Box::new(RecordingPreparer {
+                events: Arc::clone(&events),
+                count: 2,
+                fail: false,
+            })),
+            NewTimeout::UseExisting,
+            SandboxForkMode::Full,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(*events.lock().unwrap(), vec!["capture"]);
+    let source_after = orchestrator.get_sandbox(&source.id).await?.expect("source");
+    assert_eq!(source_after.state, SandboxState::Running);
+    Ok(())
+}
+
+#[tokio::test]
+async fn container_full_fork_keeps_a_child_it_could_not_tear_down() -> Result<()> {
+    setup();
+    let (orchestrator, source, behavior, events) = container_fork_fixture().await?;
+    behavior.push_action(
+        MockOperation::ForkChild,
+        MockAction::Fail {
+            message: "restore failed".to_owned(),
+        },
+    );
+    behavior.push_action(
+        MockOperation::ForkChildTeardown,
+        MockAction::Fail {
+            message: "device busy".to_owned(),
+        },
+    );
+
+    let outcomes = orchestrator
+        .fork_sandbox_with_specs(
+            source.id,
+            ForkChildren::AfterCapture(Box::new(RecordingPreparer {
+                events: Arc::clone(&events),
+                count: 2,
+                fail: false,
+            })),
+            NewTimeout::UseExisting,
+            SandboxForkMode::Full,
+        )
+        .await?;
+    let err = outcomes[0].as_ref().unwrap_err();
+    assert!(format!("{err:#}").contains("not torn down"), "{err:#}");
+    assert!(outcomes[1].is_ok());
+    // Its volumes stay reserved while its devices may use them...
+    assert_eq!(*events.lock().unwrap(), vec!["capture", "prepare"]);
+    // ...until a retried teardown succeeds.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while events.lock().unwrap().len() < 3 && Instant::now() < deadline {
+        sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        *events.lock().unwrap(),
+        vec!["capture", "prepare", "release 1"]
+    );
+    Ok(())
+}

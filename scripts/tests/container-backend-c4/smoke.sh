@@ -93,8 +93,13 @@ check "the digest names the same image" test "$(in_box "$D" 'cat /opt/app/hello'
 # --- filesystem-only fork -----------------------------------------------------
 "$AENV" exec "$A" -- sh -c 'sleep 600 >/dev/null 2>&1 &' >/dev/null 2>&1
 START=$(date +%s%N)
+# A full fork (the default mode) restores the processes too; it has its own
+# test under container-backend-fullfork. Here it only has to be accepted.
 call POST "/sandboxes/$A/fork" '{"count":1}'
-check "a full fork is refused on containers (HTTP $STATUS)" test "$STATUS" = 400
+check "a full fork is accepted on containers (HTTP $STATUS)" test "$STATUS" = 201
+FULL=$(jq -r '.[0].sandbox.sandboxID // empty' <<<"$BODY_OUT")
+check "its child keeps the parent's processes" test "$(in_box "${FULL:-none}" 'pgrep -c sleep || true')" -ge 1
+[ -n "$FULL" ] && call DELETE "/sandboxes/$FULL"
 START=$(date +%s%N)
 call POST "/sandboxes/$A/fork" '{"count":2,"mode":"filesystem"}'
 ELAPSED_MS=$(( ($(date +%s%N) - START) / 1000000 ))

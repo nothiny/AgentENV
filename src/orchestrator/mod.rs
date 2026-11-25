@@ -21,8 +21,9 @@ pub use store::{
     SandboxTimeoutAction,
 };
 pub use types::{
-    CreateSandboxRequest, SandboxForkChildSpec, SandboxLaunchSource, SandboxLifecycleEvent,
-    SandboxLifecycleEventType, SandboxState, SnapshotCaptureResult,
+    CreateSandboxRequest, ForkChildPreparer, ForkChildren, SandboxForkChildSpec,
+    SandboxLaunchSource, SandboxLifecycleEvent, SandboxLifecycleEventType, SandboxState,
+    SnapshotCaptureResult,
 };
 
 pub type Result<T> = std::result::Result<T, OrchestratorError>;
@@ -102,6 +103,12 @@ pub enum OrchestratorError {
     InvalidTimeout {
         sandbox_id: SandboxId,
         timeout: String,
+    },
+
+    #[error("sandbox {sandbox_id} cannot be forked: {reason}")]
+    ForkRefused {
+        sandbox_id: SandboxId,
+        reason: String,
     },
 
     #[error("internal error: {0}")]

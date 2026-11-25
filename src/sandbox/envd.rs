@@ -197,6 +197,16 @@ impl EnvdInstance {
             .await
     }
 
+    /// Fails unless envd accepts this instance's access token on an
+    /// endpoint that requires it. `/init` can answer 204 without switching
+    /// tokens, so a token switch is confirmed this way.
+    pub(crate) async fn verify_access_token(&self) -> Result<()> {
+        default_api::metrics_get(&self.config)
+            .await
+            .context("envd refused the access token")?;
+        Ok(())
+    }
+
     async fn post_init(
         &self,
         env_vars: Option<HashMap<String, String>>,

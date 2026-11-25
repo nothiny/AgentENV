@@ -7239,7 +7239,7 @@ impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<SandboxDetai
     }
 }
 
-/// `full` forks the running sandbox, processes and memory included (`firecracker`). `filesystem` forks only its files: children start fresh processes (`container`). A backend rejects the mode it does not implement.
+/// `full` forks the running sandbox, processes and memory included (`firecracker`; `container` on nodes whose OCI runtime checkpoints with CRIU, where each child restores one dump of the source and its established TCP connections come back closed). `filesystem` forks only its files: children start fresh processes (`container`). A backend rejects the mode it does not implement.
 /// Enumeration of values.
 /// Since this enum's variants do not hold data, we can easily define them as `#[repr(C)]`
 /// which helps with FFI.

@@ -57,6 +57,36 @@ pub struct SandboxForkChildSpec {
     pub replace_drive_ids: Vec<(String, String)>,
 }
 
+/// The children of one fork.
+pub enum ForkChildren {
+    /// Described before the fork. Their volumes, if any, were cloned from the
+    /// source before it was captured.
+    Ready(Vec<SandboxForkChildSpec>),
+    /// Described once the source has been captured, so that their volumes
+    /// are cloned from what the capture sealed and match the captured
+    /// memory. Backends that capture in the same step as they start the
+    /// children are given the children before the fork instead.
+    AfterCapture(Box<dyn ForkChildPreparer>),
+}
+
+/// Describes a fork's children and reserves what they need, such as their
+/// own copies of the source's volumes.
+#[async_trait::async_trait]
+pub trait ForkChildPreparer: Send {
+    /// How many children [`prepare`][Self::prepare] will describe.
+    fn count(&self) -> usize;
+
+    /// The children, with fresh IDs. On error, nothing stays reserved.
+    async fn prepare(
+        &mut self,
+        source: &super::SandboxMetadata,
+    ) -> anyhow::Result<Vec<SandboxForkChildSpec>>;
+
+    /// Releases what [`prepare`][Self::prepare] reserved for `children`,
+    /// which did not become sandboxes.
+    async fn release(&mut self, children: &[SandboxId]);
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SandboxLifecycleEventType {
     Create,

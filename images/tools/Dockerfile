@@ -14,7 +14,7 @@
 #
 # Build example:
 #
-#   make -C images/tools TOOLS_VERSION=0.1.1 ENVD_REF=2026.17
+#   make -C images/tools TOOLS_VERSION=0.1.2 ENVD_REF=2026.17
 #
 # Important build args:
 #   TOOLS_VERSION        Immutable AgentENV tools drive release version.
@@ -26,7 +26,7 @@
 ARG BUSYBOX_IMAGE=busybox:1.37.0-musl
 ARG DEBIAN_VERSION=bookworm
 ARG GO_VERSION=1.25.9
-ARG TOOLS_VERSION=0.1.1
+ARG TOOLS_VERSION=0.1.2
 
 # ---------------------------------------------------------------------------
 # Stage 1: compile envd from upstream source.
@@ -52,6 +52,18 @@ RUN set -eux; \
     git remote add origin "$ENVD_UPSTREAM_REPO"; \
     git fetch --depth 1 origin "$ENVD_REF"; \
     git checkout --detach FETCH_HEAD
+
+# AgentENV's changes to envd, applied in name order. Each must apply cleanly
+# to ENVD_REF; see patches/README.md.
+COPY patches/ /src/patches/
+RUN set -eux; \
+    cd /src/infra; \
+    mkdir -p /out; \
+    : > /out/envd-patches; \
+    for patch in /src/patches/*.patch; do \
+      git apply --verbose "$patch"; \
+      basename "$patch" .patch >> /out/envd-patches; \
+    done
 
 WORKDIR /src/infra/packages/envd
 
@@ -94,6 +106,9 @@ ARG TOOLS_VERSION
 COPY --chmod=0755 init /tools-rootfs/init
 COPY --chmod=0755 pivot-init /tools-rootfs/agentenv/pivot-init
 COPY --chmod=0755 --from=envd-builder /out/envd /tools-rootfs/agentenv/envd
+# The patches envd was built with, one name per line; the server checks for
+# the ones it relies on.
+COPY --chmod=0644 --from=envd-builder /out/envd-patches /tools-rootfs/agentenv/envd-patches
 
 RUN set -eux; \
     mkdir -p \

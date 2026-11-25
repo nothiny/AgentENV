@@ -39,7 +39,7 @@ pub use access::{EnvdAccessToken, SandboxAccessTokenGenerator};
 pub use backend::{
     publish_captured, CapturedRootfs, CapturedSandboxSnapshot, PausedSandboxState, SandboxBackend,
     SandboxBackendFactory, SandboxCaptureError, SandboxCaptureResult, SandboxExecutor,
-    SandboxForkResult, SandboxForkSpec, SandboxRuntimeInfo,
+    SandboxForkCapture, SandboxForkResult, SandboxForkSpec, SandboxRuntimeInfo, UnstoppedForkChild,
 };
 pub use backend_registry::BackendRegistry;
 pub use container::ContainerSandboxFactory;
