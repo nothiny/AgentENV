@@ -83,10 +83,12 @@ impl SandboxBackendKind {
             Self::Container => match capability {
                 // Pause dumps the processes with CRIU and releases every
                 // runtime resource; a full fork restores one dump into every
-                // child. Both need runc or crun and CRIU.
-                BackendCapability::Pause | BackendCapability::Fork => {
-                    CONTAINER_CRIU.load(Ordering::Relaxed)
-                }
+                // child; a snapshot stores one for later launches. All need
+                // runc or crun and CRIU.
+                BackendCapability::Pause
+                | BackendCapability::Fork
+                | BackendCapability::Snapshot
+                | BackendCapability::SnapshotRestore => CONTAINER_CRIU.load(Ordering::Relaxed),
                 // The slot's egress rules match the container's veth, which
                 // keeps the name tap0; drives are mounted on the host and
                 // bound into the container.
@@ -96,10 +98,7 @@ impl SandboxBackendKind {
                 | BackendCapability::AttachedDrives
                 | BackendCapability::RootfsImage
                 | BackendCapability::FilesystemFork => true,
-                BackendCapability::Snapshot
-                | BackendCapability::SnapshotRestore
-                | BackendCapability::ExtraBootArgs
-                | BackendCapability::CustomExtension => false,
+                BackendCapability::ExtraBootArgs | BackendCapability::CustomExtension => false,
             },
         }
     }
@@ -225,7 +224,9 @@ mod tests {
             container,
             vec![
                 Pause,
+                Snapshot,
                 RootfsImage,
+                SnapshotRestore,
                 Fork,
                 FilesystemFork,
                 ManagedVolumes,

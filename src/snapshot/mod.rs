@@ -31,4 +31,7 @@ pub use types::{
     SnapshotRuntimeVersions, SnapshotSource, SnapshotSourceKind, SnapshotVolume, StartupCommand,
     TemplateBuildErrorReason, TemplateBuildInfo, TemplateBuildStatus, SNAPSHOT_ARTIFACT_LAYOUT,
 };
-pub use types::{SandboxSnapshotManifest, FIRECRACKER_BACKEND};
+pub use types::{
+    ContainerSnapshotMount, ContainerSnapshotSection, SandboxSnapshotManifest, CONTAINER_BACKEND,
+    FIRECRACKER_BACKEND,
+};

@@ -10,8 +10,13 @@ pub(crate) const MANIFEST_FORMAT_VERSION: u32 = 1;
 /// Name `backend` takes when a record predates the field.
 pub const FIRECRACKER_BACKEND: &str = "firecracker";
 
+/// The OCI container backend. Its `vm_state` is a tar of the container's CRIU
+/// images, it has no memory image, and the manifest carries a
+/// [`ContainerSnapshotSection`].
+pub const CONTAINER_BACKEND: &str = "container";
+
 /// Names a restore knows how to reach a VMM by.
-const KNOWN_BACKENDS: &[&str] = &[FIRECRACKER_BACKEND];
+const KNOWN_BACKENDS: &[&str] = &[FIRECRACKER_BACKEND, CONTAINER_BACKEND];
 
 fn default_backend() -> String {
     FIRECRACKER_BACKEND.to_string()
@@ -56,8 +61,41 @@ pub struct SandboxSnapshotManifest {
     /// disabled consumption, and best-effort manifest resolution failures.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_startup_pack: Option<crate::snapshot::ResolvedStartupPack>,
+    /// What restoring a container capture needs beyond the shared fields.
+    /// Present exactly when `backend` is [`CONTAINER_BACKEND`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container: Option<ContainerSnapshotSection>,
 }
 
+/// The container a [`CONTAINER_BACKEND`] capture dumped, as its restore must
+/// rebuild it: CRIU maps the same tools binaries back and restores exactly
+/// the mounts it dumped.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContainerSnapshotSection {
+    /// The OCI runtime that dumped the processes; a restore needs the same.
+    pub runtime: String,
+    /// The tools image release the processes run envd and busybox from.
+    pub tools_version: String,
+    pub envd_port: u16,
+    /// Whether the container had the auth directory bound in, which hands a
+    /// restored envd its new access token.
+    pub auth_mount: bool,
+    pub resources: crate::types::SandboxResources,
+    /// The drives bound into the container, in attachment order.
+    pub mounts: Vec<ContainerSnapshotMount>,
+}
+
+/// A drive bound into a dumped container.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContainerSnapshotMount {
+    pub path: PathBuf,
+    pub read_only: bool,
+    /// A managed volume, which the snapshot restores as its own volume; an
+    /// attached drive otherwise.
+    pub volume: bool,
+}
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SnapshotVmStateArtifacts {
@@ -133,8 +171,27 @@ impl SandboxSnapshotManifest {
                 .filter(|drive| !drive.uses_reserved_slot())
                 .count(),
             memory_startup_pack: None,
+            container: None,
         }
         .with_extra_drives(attached_drives)
+    }
+
+    /// Records the container a [`CONTAINER_BACKEND`] capture dumped.
+    pub fn with_container(mut self, section: ContainerSnapshotSection) -> Result<Self> {
+        if self.backend != CONTAINER_BACKEND {
+            bail!(
+                "only a container capture describes a container, not a {} one",
+                self.backend
+            );
+        }
+        self.container = Some(section);
+        Ok(self)
+    }
+
+    /// Whether the capture has a memory image. A container capture keeps its
+    /// memory in the CRIU images instead.
+    pub fn has_memory_image(&self) -> bool {
+        !self.memory.image_config_path.as_os_str().is_empty()
     }
 
     /// Attached drives with their own Firecracker drive IDs. Snapshots created
@@ -290,6 +347,7 @@ mod tests {
             volume_drive_slots: 0,
             physical_extra_drive_count: 1,
             memory_startup_pack: None,
+            container: None,
         };
 
         let drives = manifest.extra_drives();
@@ -308,6 +366,56 @@ mod tests {
         let manifest: SandboxSnapshotManifest =
             serde_json::from_value(json).expect("old manifest must parse");
         assert!(manifest.memory_startup_pack.is_none());
+    }
+
+    fn container_section() -> ContainerSnapshotSection {
+        ContainerSnapshotSection {
+            runtime: "runc".into(),
+            tools_version: "0.1.2".into(),
+            envd_port: 49983,
+            auth_mount: true,
+            resources: crate::types::SandboxResources::default(),
+            mounts: vec![ContainerSnapshotMount {
+                path: PathBuf::from("/data"),
+                read_only: false,
+                volume: true,
+            }],
+        }
+    }
+
+    #[test]
+    fn a_container_capture_round_trips_without_a_memory_image() {
+        let manifest = SandboxSnapshotManifest::new(
+            CONTAINER_BACKEND,
+            "criu.tar",
+            PathBuf::new(),
+            0,
+            "rootfs/image.json",
+            4096,
+            &[],
+        )
+        .unwrap()
+        .with_container(container_section())
+        .unwrap();
+        assert!(!manifest.has_memory_image());
+        let decoded: SandboxSnapshotManifest =
+            serde_json::from_value(serde_json::to_value(&manifest).unwrap()).unwrap();
+        assert_eq!(decoded.backend, CONTAINER_BACKEND);
+        assert_eq!(decoded.container, Some(container_section()));
+    }
+
+    #[test]
+    fn only_a_container_capture_describes_a_container() {
+        let firecracker = SandboxSnapshotManifest::for_test(4096, &[]);
+        assert!(firecracker.has_memory_image());
+        assert!(firecracker
+            .clone()
+            .with_container(container_section())
+            .is_err());
+        // Records written before the section existed have none.
+        let decoded: SandboxSnapshotManifest =
+            serde_json::from_value(serde_json::to_value(&firecracker).unwrap()).unwrap();
+        assert!(decoded.container.is_none());
     }
 
     #[test]

@@ -176,12 +176,13 @@ impl ContainerForkCapture {
         );
         child.restore = Some(Restore {
             criu_dir: self.criu_dir.clone(),
-            tools_image_config: self.tools_image_config.clone(),
+            tools: super::RestoreTools::Config(self.tools_image_config.clone()),
             rootfs_virtual_size: self.rootfs_virtual_size,
             envd_port: self.envd_port,
+            archive: None,
         });
         child.auth_mount = self.auth_mount;
-        child.fork_child = true;
+        child.new_identity = true;
         Ok(child)
     }
 

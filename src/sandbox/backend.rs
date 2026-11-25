@@ -374,6 +374,13 @@ pub trait SandboxBackend: Send + 'static {
         Ok(())
     }
 
+    /// Whether [`snapshot`][Self::snapshot] can capture this sandbox,
+    /// checked before it is frozen. The error says why not; the caller
+    /// reports it to the client.
+    fn check_snapshot(&self) -> Result<()> {
+        Ok(())
+    }
+
     /// Capture this running sandbox once for a full fork whose children are
     /// described only afterwards, so that their volumes can be cloned from
     /// what this capture sealed: memory, root filesystem and volumes all come

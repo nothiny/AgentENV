@@ -105,6 +105,12 @@ pub enum OrchestratorError {
         timeout: String,
     },
 
+    #[error("sandbox {sandbox_id} cannot be snapshotted: {reason}")]
+    SnapshotRefused {
+        sandbox_id: SandboxId,
+        reason: String,
+    },
+
     #[error("sandbox {sandbox_id} cannot be forked: {reason}")]
     ForkRefused {
         sandbox_id: SandboxId,

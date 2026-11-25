@@ -6406,14 +6406,9 @@ async fn sandbox_logs_filters_inherited_history_and_does_not_hold_runtime_lock()
 
 // ---- backend capabilities ---------------------------------------------------
 
-/// A running sandbox relabelled as a container sandbox, plus a mock behavior
-/// that fails the test if a memory snapshot reaches the backend.
+/// A running sandbox relabelled as a container sandbox.
 async fn running_container_sandbox() -> Result<(Arc<TestOrchestrator>, SandboxMetadata)> {
     let behavior = Arc::new(MockBehavior::new());
-    behavior.set_on_operation(
-        MockOperation::Snapshot,
-        Arc::new(|| panic!("a memory snapshot reached a container sandbox")),
-    );
     let orchestrator = make_orchestrator_without_background_with_factory(
         InMemoryMetadataStore::new(),
         MockBackendFactory::with_behavior(behavior),
@@ -6454,22 +6449,14 @@ async fn container_sandboxes_reject_unsupported_operations_without_side_effects(
     let (orchestrator, sandbox) = running_container_sandbox().await?;
     let id = sandbox.id;
 
-    assert_unsupported(
-        orchestrator.capture_snapshot(id).await.unwrap_err(),
-        BackendCapability::Snapshot,
-    );
-    assert_unsupported(
-        orchestrator
-            .patch_sandbox_custom_extension_params(id, serde_json::Map::new())
-            .await
-            .unwrap_err(),
-        BackendCapability::CustomExtension,
-    );
-    assert!(orchestrator
-        .capture_snapshot(id)
+    // Memory snapshots follow the node's CRIU support (see the capability
+    // table test); custom extensions are never supported.
+    let err = orchestrator
+        .patch_sandbox_custom_extension_params(id, serde_json::Map::new())
         .await
-        .unwrap_err()
-        .is_backend_rejection());
+        .unwrap_err();
+    assert!(err.is_backend_rejection());
+    assert_unsupported(err, BackendCapability::CustomExtension);
 
     let current = orchestrator.get_sandbox(&id).await?.expect("still present");
     assert_eq!(current.state, SandboxState::Running);
@@ -6868,5 +6855,41 @@ async fn container_full_fork_keeps_a_child_it_could_not_tear_down() -> Result<()
         *events.lock().unwrap(),
         vec!["capture", "prepare", "release 1"]
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_snapshot_the_backend_refuses_is_a_client_error_and_freezes_nothing() -> Result<()> {
+    setup();
+    let behavior = Arc::new(MockBehavior::new());
+    let orchestrator =
+        make_orchestrator_with_factory(MockBackendFactory::with_behavior(Arc::clone(&behavior)))
+            .await;
+    let created = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?;
+    behavior.set_on_operation(
+        MockOperation::Snapshot,
+        Arc::new(|| panic!("a refused snapshot must not capture")),
+    );
+    behavior.push_action(
+        MockOperation::CheckSnapshot,
+        MockAction::Fail {
+            message: "it has writable attached drive 'scratch'".to_owned(),
+        },
+    );
+    let err = orchestrator.capture_snapshot(created.id).await.unwrap_err();
+    match err {
+        OrchestratorError::SnapshotRefused { sandbox_id, reason } => {
+            assert_eq!(sandbox_id, created.id);
+            assert!(reason.contains("scratch"), "{reason}");
+        }
+        other => panic!("expected SnapshotRefused, got {other:?}"),
+    }
+    let after = orchestrator
+        .get_sandbox(&created.id)
+        .await?
+        .expect("sandbox");
+    assert_eq!(after.state, SandboxState::Running);
     Ok(())
 }

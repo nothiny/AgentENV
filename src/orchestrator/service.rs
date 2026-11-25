@@ -514,7 +514,10 @@ where
                 let record = snapshot.record();
                 let committed = snapshot.committed();
                 let configured_mode = ConfigManager::global_config().virtualization_mode;
-                if committed.virtualization_mode != configured_mode {
+                // The mode describes a VM; a container capture runs on any.
+                if backend != SandboxBackendKind::Container
+                    && committed.virtualization_mode != configured_mode
+                {
                     self.counters.record_create_fail(1);
                     return Err(OrchestratorError::VirtualizationModeMismatch {
                         resource: format!("snapshot {}", record.id),
@@ -2047,6 +2050,17 @@ where
     ) -> Result<SnapshotCaptureResult> {
         self.require_capability(sandbox_id, BackendCapability::Snapshot)
             .await?;
+        // Refuse what the backend already knows it cannot capture, before
+        // the sandbox is frozen.
+        let handle = self.sandboxes.read().await.get(&sandbox_id).cloned();
+        if let Some(handle) = handle {
+            if let Err(reason) = handle.lock().await.check_snapshot() {
+                return Err(OrchestratorError::SnapshotRefused {
+                    sandbox_id,
+                    reason: format!("{reason:#}"),
+                });
+            }
+        }
         let this = Arc::clone(self);
         self.run_cancellation_safe("snapshot", sandbox_id, async move {
             this.capture_snapshot_inner(sandbox_id).await

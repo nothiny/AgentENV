@@ -2645,7 +2645,15 @@ paths:
   /sandboxes/{sandboxID}/snapshots:
     post:
       summary: Create snapshot
-      description: Create a persistent snapshot from the sandbox's current state. Snapshots can be used to create new sandboxes and persist beyond the original sandbox's lifetime.
+      description: >
+        Create a persistent snapshot from the sandbox's current state. Snapshots can be used to
+        create new sandboxes and persist beyond the original sandbox's lifetime. A `container`
+        sandbox can be snapshotted on nodes whose OCI runtime checkpoints with CRIU: its processes,
+        root filesystem and volumes are captured in one frozen window, and a sandbox launched from
+        the snapshot restores the processes with its own access token and established TCP
+        connections closed. It mounts exactly the snapshot's drives and volumes. A secure container
+        needs a tools image with the access-token-hash-file envd patch; otherwise, and for a
+        container with a writable attached drive, the request returns HTTP 400.
       tags: [sandboxes]
       security:
         - ApiKeyAuth: []

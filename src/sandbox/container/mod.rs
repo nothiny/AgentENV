@@ -11,9 +11,9 @@
 //!
 //! Supported: cold start, exec, files, proxy, delete, egress rules, network
 //! policy updates, managed volumes, attached drives, root filesystem capture
-//! for publishing as an image, filesystem-only and full forks, and pause.
-//! Memory snapshots are rejected before they reach this backend (see
-//! `SandboxBackendKind::supports`).
+//! for publishing as an image, filesystem-only and full forks, pause, and
+//! memory snapshots with launches from them. Template builds still need
+//! Firecracker (`capture_to_dir`).
 //!
 //! Pause freezes the container, dumps its processes with CRIU and seals the
 //! rootfs and drives into the paused sandbox's artifact root, all while the
@@ -22,7 +22,9 @@
 //! network slot and cgroup, and `runc restore`s the processes into it.
 //!
 //! A full fork dumps the processes once and restores the dump into every
-//! child (see [`fork`]).
+//! child (see [`fork`]). A memory snapshot is captured the same way and
+//! stored by the snapshot pipeline; sandboxes launched from it restore its
+//! dump (see [`snapshot`]).
 //!
 //! Capture and fork both seal the rootfs: freeze its host mount, turn the
 //! writable upper into a read-only layer the live device restacks onto, and
@@ -42,6 +44,7 @@ mod logfile;
 mod netns;
 mod paused;
 mod runtime;
+mod snapshot;
 mod subpath;
 
 use std::any::Any;
@@ -430,12 +433,69 @@ impl SandboxBackendFactory for ContainerSandboxFactory {
         )))
     }
 
+    /// A new container that restores a container snapshot's processes: the
+    /// snapshot's rootfs under a new upper, its attached drives and the
+    /// launch's volumes at the dumped mount paths, and this sandbox's own
+    /// identity and access token.
     fn build_from_snapshot(
         &self,
-        _snapshot: &RunnableSnapshot,
-        _launch_config: SandboxLaunchConfig,
+        snapshot: &RunnableSnapshot,
+        launch_config: SandboxLaunchConfig,
     ) -> Result<Box<dyn SandboxBackend>> {
-        bail!("container sandboxes cannot be launched from snapshots")
+        if !nix::unistd::Uid::effective().is_root() {
+            bail!("the container backend requires the server to run as root");
+        }
+        let manifest = snapshot.manifest();
+        let section = manifest.container.as_ref().with_context(|| {
+            format!(
+                "snapshot {} is a {} capture, not a container's",
+                snapshot.record().id,
+                manifest.backend
+            )
+        })?;
+        if !runtime::same_executable(&section.runtime, self.runtime.binary()) {
+            bail!(
+                "snapshot {} was dumped by {} but this node runs {}",
+                snapshot.record().id,
+                section.runtime,
+                self.runtime.binary()
+            );
+        }
+        let extra_drives = snapshot::arrange_drives(
+            section,
+            &manifest.extra_drives(),
+            &launch_config.extra_drives,
+        )?;
+        let build_spec = FreshSandboxBuildSpec {
+            backend: crate::types::SandboxBackendKind::Container,
+            image_config_path: manifest.rootfs.image_config_path.clone(),
+            context: snapshot.committed().context.clone(),
+            resources: section.resources,
+            extra_drives,
+            extra_boot_args: None,
+        };
+        let launch = SandboxLaunchConfig {
+            extra_drives: Vec::new(),
+            ..launch_config
+        };
+        let mut sandbox = ContainerSandbox::new(
+            build_spec,
+            launch,
+            self.runtime.clone(),
+            &self.paths,
+            layers::LayerRefs::default(),
+        );
+        sandbox.restore = Some(Restore {
+            criu_dir: sandbox.work_dir.join("criu-images"),
+            tools: RestoreTools::Release(section.tools_version.clone()),
+            rootfs_virtual_size: Some(manifest.rootfs.virtual_size),
+            envd_port: section.envd_port,
+            archive: Some(manifest.vm_state.path.clone()),
+        });
+        sandbox.auth_mount = section.auth_mount;
+        sandbox.new_identity = true;
+        sandbox.snapshot_hold = Some(snapshot.clone());
+        Ok(Box::new(sandbox))
     }
 
     fn decode_paused_state(
@@ -497,9 +557,10 @@ impl SandboxBackendFactory for ContainerSandboxFactory {
         );
         sandbox.restore = Some(Restore {
             criu_dir: state.criu_dir.clone(),
-            tools_image_config: state.tools_image_config.clone(),
+            tools: RestoreTools::Config(state.tools_image_config.clone()),
             rootfs_virtual_size: state.rootfs_virtual_size,
             envd_port: state.envd_port,
+            archive: None,
         });
         sandbox.auth_mount = state.auth_mount;
         Ok(Box::new(sandbox))
@@ -543,9 +604,22 @@ pub struct ContainerSandbox {
     /// Whether the container has the auth directory bound in: always for a
     /// new one, as dumped for a restored one.
     auth_mount: bool,
-    /// A full-fork child, whose restored envd holds its source's token until
-    /// `/init` hands it this sandbox's own.
-    fork_child: bool,
+    /// A sandbox restored under an identity other than the dumped one (a
+    /// full-fork child, or a launch from a snapshot): its restored envd
+    /// holds the source's token until `/init` hands it this sandbox's own.
+    new_identity: bool,
+    /// The snapshot a launch restores, held until the sandbox stops: it
+    /// keeps the cached artifacts the restore reads.
+    snapshot_hold: Option<RunnableSnapshot>,
+}
+
+/// The exact tools image a restore needs.
+#[derive(Clone, Debug)]
+enum RestoreTools {
+    /// Its image config on this node.
+    Config(PathBuf),
+    /// Its release, resolved when the sandbox starts.
+    Release(String),
 }
 
 /// What resuming a paused container takes from its persisted state, beyond
@@ -553,9 +627,14 @@ pub struct ContainerSandbox {
 #[derive(Clone, Debug)]
 struct Restore {
     criu_dir: PathBuf,
-    tools_image_config: PathBuf,
+    /// The tools image the dumped processes map envd and busybox from.
+    tools: RestoreTools,
     rootfs_virtual_size: Option<u64>,
     envd_port: u16,
+    /// A tar of the CRIU images that start unpacks into `criu_dir`, which
+    /// is removed once the sandbox is ready. Set for a launch from a
+    /// snapshot.
+    archive: Option<PathBuf>,
 }
 
 impl ContainerSandbox {
@@ -594,7 +673,8 @@ impl ContainerSandbox {
             pending_fork_rootfs: None,
             restore: None,
             auth_mount: true,
-            fork_child: false,
+            new_identity: false,
+            snapshot_hold: None,
         }
     }
 
@@ -629,7 +709,10 @@ impl ContainerSandbox {
             .clone()
             .context("container has no rootfs image config")
             .map_err(SandboxCaptureError::recoverable)?;
-        self.seal_layer(&device, &live_config, "rootfs.commit", "rootfs")
+        // Snapshot publication stores a sealed layer without a descriptor
+        // only under a runtime-generated delta's name; each sealed layer has
+        // its own directory, so the name never collides.
+        self.seal_layer(&device, &live_config, "snapshot.commit", "rootfs")
             .await
     }
 
@@ -744,13 +827,6 @@ impl ContainerSandbox {
     /// let the processes run again. Volumes are sealed into their own
     /// directories, where the caller clones the children's volumes from.
     async fn capture_for_fork(&mut self) -> SandboxCaptureResult<fork::ContainerForkCapture> {
-        self.refuse_writable_attached_drives()?;
-        if self.has_exited() {
-            return Err(SandboxCaptureError::terminal(anyhow!(
-                "container sandbox {} has exited",
-                self.id
-            )));
-        }
         let tools_image_config = self
             .tools
             .as_ref()
@@ -759,7 +835,31 @@ impl ContainerSandbox {
             .map_err(SandboxCaptureError::recoverable)?;
         let dir = fork::CaptureDir::create(&self.paths.captures_base)
             .map_err(SandboxCaptureError::recoverable)?;
-        let criu_dir = dir.path().join("criu");
+        let (criu_dir, rootfs_image_config) = self
+            .capture_frozen(dir.path(), "container-fork-seal", "a full fork")
+            .await?;
+        self.fork_capture(dir, criu_dir, rootfs_image_config, tools_image_config)
+    }
+
+    /// Freezes the processes, dumps them into `<dir>/criu` and seals the
+    /// writable volumes and the rootfs in that frozen window, then lets the
+    /// processes run again: memory, volumes and rootfs from one instant.
+    /// Volumes are sealed into their own directories. Returns the dump and
+    /// the sealed rootfs stack's image config.
+    async fn capture_frozen(
+        &mut self,
+        dir: &Path,
+        failpoint: &str,
+        purpose: &str,
+    ) -> SandboxCaptureResult<(PathBuf, PathBuf)> {
+        self.refuse_writable_attached_drives()?;
+        if self.has_exited() {
+            return Err(SandboxCaptureError::terminal(anyhow!(
+                "container sandbox {} has exited",
+                self.id
+            )));
+        }
+        let criu_dir = dir.join("criu");
         let started = std::time::Instant::now();
         self.runtime
             .pause(&self.container_id)
@@ -771,8 +871,7 @@ impl ContainerSandbox {
                 .await
                 .context("dump container processes")
                 .map_err(SandboxCaptureError::recoverable)?;
-            super::failpoint::fail("container-fork-seal", None)
-                .map_err(SandboxCaptureError::recoverable)?;
+            super::failpoint::fail(failpoint, None).map_err(SandboxCaptureError::recoverable)?;
             self.freeze_volumes()
                 .map_err(SandboxCaptureError::recoverable)?;
             let rootfs_mount = self.work_dir.join("rootfs");
@@ -791,16 +890,26 @@ impl ContainerSandbox {
                 resumed.map_err(SandboxCaptureError::terminal)?;
                 image_config
             }
-            // Dropping `dir` removes whatever the dump wrote.
+            // Dropping the caller's capture directory removes whatever the
+            // dump wrote.
             Err(err) => return Err(capture_failure(err, resumed)),
         };
         info!(
             container = %self.container_id,
-            capture = %dir.path().display(),
+            capture = %dir.display(),
             elapsed = ?started.elapsed(),
-            "container captured for a full fork"
+            "container captured for {purpose}"
         );
+        Ok((criu_dir, rootfs_image_config))
+    }
 
+    fn fork_capture(
+        &self,
+        dir: fork::CaptureDir,
+        criu_dir: PathBuf,
+        rootfs_image_config: PathBuf,
+        tools_image_config: PathBuf,
+    ) -> SandboxCaptureResult<fork::ContainerForkCapture> {
         let drives = self
             .drives
             .iter()
@@ -832,6 +941,81 @@ impl ContainerSandbox {
             runtime: self.runtime.clone(),
             paths: self.paths.clone(),
         })
+    }
+
+    /// Describes a capture: the CRIU image archive, the sealed rootfs, the
+    /// read-only attached drives as they are, and what a restore must
+    /// rebuild. Volumes are left to the volume catalog, as for Firecracker.
+    fn snapshot_manifest(
+        &self,
+        archive: &Path,
+        rootfs_image_config: PathBuf,
+    ) -> Result<crate::snapshot::SandboxSnapshotManifest> {
+        let rootfs_virtual_size = self
+            .rootfs_virtual_size
+            .context("container rootfs size is unknown")?;
+        let sized = self
+            .drives
+            .iter()
+            .map(|attached| {
+                attached
+                    .drive
+                    .try_with_virtual_size(attached.runtime.actual_virtual_size)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let attached: Vec<_> = sized
+            .iter()
+            .filter(|drive| !drive.is_volume())
+            .cloned()
+            .collect();
+        let section = crate::snapshot::ContainerSnapshotSection {
+            runtime: self.runtime.binary().to_owned(),
+            tools_version: snapshot::tools_version(&self.work_dir)?,
+            envd_port: self.envd_port(ConfigManager::global_config()),
+            auth_mount: self.auth_mount,
+            resources: self.resources,
+            mounts: snapshot::mounts_of(&sized),
+        };
+        crate::snapshot::SandboxSnapshotManifest::new(
+            crate::snapshot::CONTAINER_BACKEND,
+            archive,
+            PathBuf::new(),
+            0,
+            rootfs_image_config,
+            rootfs_virtual_size,
+            &attached,
+        )?
+        .with_container(section)
+    }
+
+    /// Whether this sandbox can be captured for a fork or a snapshot,
+    /// checked before anything is frozen; the error says why not. Nothing
+    /// can share a writable attached drive, and `restored` (a fork child, a
+    /// launch) takes a new access token from the source's envd only through
+    /// the auth directory and the patched envd.
+    fn check_capture(&self, restored: &str) -> Result<()> {
+        if let Some(attached) = self.writable_attached_drive() {
+            bail!(
+                "it has writable attached drive '{}'",
+                attached.drive.drive_id()
+            );
+        }
+        if self.launch.envd_access_token.is_some() {
+            if !self.auth_mount {
+                bail!(
+                    "it is secure and was started before {restored} could take its own access \
+                     token; recreate it"
+                );
+            }
+            if !self.tools_envd_has_patch(fork::ACCESS_TOKEN_PATCH) {
+                bail!(
+                    "it is secure, and its tools image's envd lacks the {} patch that hands \
+                     {restored} its own access token (tools 0.1.2 or later)",
+                    fork::ACCESS_TOKEN_PATCH
+                );
+            }
+        }
+        Ok(())
     }
 
     /// Forks cannot share a writable attached drive, and nothing gives each
@@ -1005,9 +1189,12 @@ impl ContainerSandbox {
 
     async fn attach_storage(&mut self, config: &AppConfig) -> Result<()> {
         let global_config = config.ublk.overlaybd.global_config_path.clone();
-        let tools_config = match &self.restore {
+        let tools_config = match self.restore.as_ref().map(|restore| &restore.tools) {
             // The restored processes map envd and busybox from this image.
-            Some(restore) => restore.tools_image_config.clone(),
+            Some(RestoreTools::Config(path)) => path.clone(),
+            Some(RestoreTools::Release(version)) => resolve_tools_image(config, version)
+                .await?
+                .with_context(|| format!("tools image {version} is not an OverlayBD image"))?,
             None => resolve_tools_image(config, config.resolved_tools_version())
                 .await?
                 .context("the container backend needs an OverlayBD tools image")?,
@@ -1309,8 +1496,16 @@ impl ContainerSandbox {
             restore: self.restore.is_some(),
             auth: self.auth_mount,
         })?;
-        if self.fork_child {
+        if self.new_identity {
             self.hand_over_access_token()?;
+        }
+        if let Some(Restore {
+            criu_dir,
+            archive: Some(archive),
+            ..
+        }) = &self.restore
+        {
+            snapshot::unpack(archive.clone(), criu_dir.clone()).await?;
         }
         self.start_runtime()?;
 
@@ -1328,25 +1523,29 @@ impl ContainerSandbox {
         Ok(())
     }
 
-    /// Names this fork child's own access token in its auth directory, which
-    /// its restored envd checks when `/init` brings a token other than the
-    /// source's it holds.
+    /// Names this sandbox's own access token, or none, in its auth
+    /// directory, which its restored envd checks when `/init` brings a token
+    /// other than the source's it holds. A source without the auth directory
+    /// was not secure (captures of secure ones are refused): its envd holds
+    /// no token and takes the first one `/init` brings.
     fn hand_over_access_token(&self) -> Result<()> {
-        let Some(token) = &self.launch.envd_access_token else {
-            return Ok(());
-        };
         if !self.auth_mount {
-            bail!("the source container has no auth directory to hand a fork child its token");
+            return Ok(());
         }
+        let token = self
+            .launch
+            .envd_access_token
+            .as_ref()
+            .map_or("", EnvdAccessToken::expose);
         use sha2::Digest;
-        let hash = hex::encode(sha2::Sha512::digest(token.expose().as_bytes()));
+        let hash = hex::encode(sha2::Sha512::digest(token.as_bytes()));
         std::fs::write(
             self.work_dir
                 .join(bundle::AUTH_DIR)
                 .join(bundle::ACCESS_TOKEN_HASH),
             hash,
         )
-        .context("write fork child access token hash")
+        .context("write the access token hash for a restored envd")
     }
 
     /// Waits until the runtime reports a restored container running. CRIU
@@ -1430,19 +1629,30 @@ impl ContainerSandbox {
                 context.user.clone(),
             )
             .await;
-        if self.fork_child && self.launch.envd_access_token.is_some() {
+        if self.new_identity {
             const NEEDS_PATCH: &str = "envd must be built with the tools image's \
                                        access-token-hash-file patch";
             init.with_context(|| {
-                format!("initialize envd with the fork child's own access token ({NEEDS_PATCH})")
+                format!("initialize the restored envd with this sandbox's token ({NEEDS_PATCH})")
             })?;
-            // `/init` can answer 204 without switching; only routing the child
-            // once its own token works keeps the source's token out of it.
+            // `/init` can answer 204 without switching; only routing the
+            // sandbox once its own token works keeps the source's out of it.
             envd.verify_access_token().await.with_context(|| {
-                format!("hand the fork child its own access token ({NEEDS_PATCH})")
+                format!("hand the restored envd this sandbox's token ({NEEDS_PATCH})")
             })?;
         } else {
             init.context("initialize envd")?;
+        }
+        if let Some(Restore {
+            criu_dir,
+            archive: Some(_),
+            ..
+        }) = &self.restore
+        {
+            // The processes are restored; the unpacked images are not needed.
+            if let Err(err) = std::fs::remove_dir_all(criu_dir) {
+                warn!(dump = %criu_dir.display(), error = %err, "failed to remove unpacked CRIU images");
+            }
         }
         debug!(container = %self.container_id, elapsed = ?started.elapsed(), "envd initialized");
         Ok(())
@@ -1521,6 +1731,7 @@ impl ContainerSandbox {
             self.layers.release();
         }
         if failures.is_empty() {
+            self.snapshot_hold = None;
             if let Err(err) = std::fs::remove_dir_all(&self.work_dir) {
                 if err.kind() != std::io::ErrorKind::NotFound {
                     failures.push(format!("remove work directory: {err}"));
@@ -1614,10 +1825,30 @@ impl SandboxBackend for ContainerSandbox {
         self.thaw_paused().await
     }
 
+    /// A memory snapshot: captured in one frozen window like a full fork,
+    /// with the CRIU images packed into one archive afterwards, while the
+    /// sandbox already runs again. The capture holds the archive and the
+    /// sealed rootfs layers until the snapshot is published.
     async fn snapshot(&mut self) -> SandboxCaptureResult<CapturedSandboxSnapshot> {
-        Err(SandboxCaptureError::recoverable(anyhow!(
-            "container sandboxes cannot be snapshotted"
-        )))
+        self.check_capture("a sandbox launched from it")
+            .context("cannot snapshot this sandbox")
+            .map_err(SandboxCaptureError::recoverable)?;
+        let dir = fork::CaptureDir::create(&self.paths.captures_base)
+            .map_err(SandboxCaptureError::recoverable)?;
+        let (criu_dir, rootfs_image_config) = self
+            .capture_frozen(dir.path(), "container-snapshot-seal", "a snapshot")
+            .await?;
+        let hold = layers::LayerHold::new(self.layers.inherit());
+        let archive = dir.path().join("criu.tar");
+        let manifest = async {
+            snapshot::pack(criu_dir.clone(), archive.clone()).await?;
+            std::fs::remove_dir_all(&criu_dir)
+                .with_context(|| format!("remove {}", criu_dir.display()))?;
+            self.snapshot_manifest(&archive, rootfs_image_config)
+        }
+        .await
+        .map_err(SandboxCaptureError::recoverable)?;
+        Ok(CapturedSandboxSnapshot::new(manifest, (dir, hold)))
     }
 
     /// Volume snapshots of a running container precede only a fork, so the
@@ -1685,28 +1916,20 @@ impl SandboxBackend for ContainerSandbox {
     }
 
     fn check_fork(&self, mode: crate::types::SandboxForkMode) -> Result<()> {
-        if let Some(attached) = self.writable_attached_drive() {
-            bail!(
-                "it has writable attached drive '{}', which no child can share",
-                attached.drive.drive_id()
-            );
+        match mode {
+            crate::types::SandboxForkMode::Full => self.check_capture("a fork child"),
+            crate::types::SandboxForkMode::Filesystem => match self.writable_attached_drive() {
+                Some(attached) => bail!(
+                    "it has writable attached drive '{}'",
+                    attached.drive.drive_id()
+                ),
+                None => Ok(()),
+            },
         }
-        if mode == crate::types::SandboxForkMode::Full && self.launch.envd_access_token.is_some() {
-            if !self.auth_mount {
-                bail!(
-                    "it is secure and was started before fork children could take their own \
-                     access token; recreate it to fork it"
-                );
-            }
-            if !self.tools_envd_has_patch(fork::ACCESS_TOKEN_PATCH) {
-                bail!(
-                    "it is secure, and its tools image's envd lacks the {} patch that hands \
-                     a child its own access token (tools 0.1.2 or later)",
-                    fork::ACCESS_TOKEN_PATCH
-                );
-            }
-        }
-        Ok(())
+    }
+
+    fn check_snapshot(&self) -> Result<()> {
+        self.check_capture("a sandbox launched from it")
     }
 
     async fn capture_fork(&mut self) -> SandboxCaptureResult<Box<dyn SandboxForkCapture>> {

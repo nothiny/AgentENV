@@ -61,6 +61,8 @@ pub enum MockOperation {
     CaptureFork,
     /// Stopping a child whose start failed, inside a fork capture's spawn.
     ForkChildTeardown,
+    /// The check before a snapshot freezes anything.
+    CheckSnapshot,
     Stop,
     UpdateNetwork,
 }
@@ -403,6 +405,10 @@ impl SandboxBackend for MockSandboxBackend {
                     })
             })
             .collect())
+    }
+
+    fn check_snapshot(&self) -> Result<()> {
+        self.behavior.apply_sync(MockOperation::CheckSnapshot)
     }
 
     async fn capture_fork(&mut self) -> SandboxCaptureResult<Box<dyn SandboxForkCapture>> {

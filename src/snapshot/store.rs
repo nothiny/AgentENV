@@ -157,9 +157,14 @@ impl<'a, R: Repository + ?Sized> LayerStore<'a, R> {
                 Some(rootfs_config),
             )
             .await?;
-        let memory_layers = self
-            .store_memory_layers(&manifest.memory.image_config_path)
-            .await?;
+        // A container capture has no memory image: its CRIU images, in
+        // `vm_state`, hold the memory.
+        let memory_layers = if manifest.has_memory_image() {
+            self.store_memory_layers(&manifest.memory.image_config_path)
+                .await?
+        } else {
+            Vec::new()
+        };
 
         self.repository
             .put_blob(
@@ -482,7 +487,9 @@ fn validate_image_configs(manifest: &SandboxSnapshotManifest) -> RepositoryResul
             })
     };
     validate(&manifest.rootfs.image_config_path, "rootfs", String::new())?;
-    validate(&manifest.memory.image_config_path, "memory", String::new())?;
+    if manifest.has_memory_image() {
+        validate(&manifest.memory.image_config_path, "memory", String::new())?;
+    }
     for drive in &manifest.attached_drives {
         validate(
             &drive.image_config_path,
@@ -560,6 +567,35 @@ mod tests {
             serde_json::to_vec_pretty(&value).expect("serialize image config"),
         )
         .expect("write image config");
+    }
+
+    #[test]
+    fn a_capture_without_a_memory_image_validates() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let rootfs = temp.path().join("rootfs.json");
+        write_test_image(
+            &rootfs,
+            json!({
+                "repoBlobUrl": "https://registry.example/v2/ns/image/blobs",
+                "lowers": [{"digest": "sha256:base", "size": 4096}]
+            }),
+        );
+        let manifest = SandboxSnapshotManifest::new(
+            crate::snapshot::CONTAINER_BACKEND,
+            temp.path().join("criu.tar"),
+            std::path::PathBuf::new(),
+            0,
+            &rootfs,
+            4096,
+            &[],
+        )
+        .expect("manifest");
+        validate_image_configs(&manifest).expect("no memory image to validate");
+
+        // A Firecracker capture's memory image must still be readable.
+        let mut firecracker = manifest.clone();
+        firecracker.memory.image_config_path = temp.path().join("missing.json");
+        assert!(validate_image_configs(&firecracker).is_err());
     }
 
     #[test]

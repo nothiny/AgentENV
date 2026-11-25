@@ -89,7 +89,8 @@ impl From<OrchestratorError> for models::Error {
             }
             OrchestratorError::SandboxNotFound(id) => sandbox_not_found(id),
             OrchestratorError::InvalidSandboxState { .. }
-            | OrchestratorError::ForkRefused { .. } => Self::new(400, err.to_string()),
+            | OrchestratorError::ForkRefused { .. }
+            | OrchestratorError::SnapshotRefused { .. } => Self::new(400, err.to_string()),
             OrchestratorError::SandboxOperationFailed {
                 sandbox_id,
                 operation,
@@ -1096,11 +1097,20 @@ impl ApiImpl {
         {
             return Ok(SandboxesPostResponse::Status400_BadRequest(error));
         }
+        // CRIU restores exactly the mounts a container snapshot dumped.
+        let container_snapshot = snapshot.manifest().container.is_some();
+        if container_snapshot && (attached_drives.is_some() || body.volume_mounts.is_some()) {
+            return Ok(SandboxesPostResponse::Status400_BadRequest(Self::error(
+                400,
+                "a sandbox launched from a container snapshot mounts exactly the snapshot's \
+                 drives and volumes; omit attachedDrives and volumeMounts",
+            )));
+        }
         let attached_drives = attached_drives.unwrap_or_default();
         let requested_drive_count =
             attached_drives.len() + body.volume_mounts.as_ref().map_or(0, Vec::len);
         let free_slots = snapshot.manifest().free_drive_slots();
-        if requested_drive_count > free_slots {
+        if !container_snapshot && requested_drive_count > free_slots {
             return Ok(SandboxesPostResponse::Status400_BadRequest(Self::error(
                 400,
                 format!(
@@ -2385,7 +2395,10 @@ impl Sandboxes<()> for ApiImpl {
                     )),
                 );
             }
-            Err(err) if err.is_backend_rejection() => {
+            Err(err)
+                if err.is_backend_rejection()
+                    || matches!(err, OrchestratorError::SnapshotRefused { .. }) =>
+            {
                 return Ok(
                     SandboxesSandboxIdSnapshotsPostResponse::Status400_BadRequest(err.into()),
                 );
